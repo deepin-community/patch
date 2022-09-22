@@ -1,0 +1,15 @@
+path_max
+558485-backupmode
+m-merge
+Fix_segfault_with_mangled_rename_patch.patch
+Allow_input_files_to_be_missing_for_ed-style_patches.patch
+Fix_arbitrary_command_execution_in_ed-style_patches.patch
+0001-Fix-ed-style-test-failure.patch
+0002-Abort_when_cleaning_up_fails.patch
+0003-Do_not_crash_when_RLIMIT_NOFILE_is_set_to_RLIM_INFINITY.patch
+0004-CVE-2019-13636.patch
+0005-CVE-2019-13638.patch
+0006-Do_not_leak_temporary_file.patch
+0007-Do_not_leak_temporary_file_on_failed_multi-file.patch
+0008-Avoid_invalid_memory_access_in_context_format_diffs.patch
+0009-Fix_failed_assertion_outstate-after_newline.patch

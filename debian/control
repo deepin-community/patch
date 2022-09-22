@@ -1,0 +1,19 @@
+Source: patch
+Section: vcs
+Priority: optional
+Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
+Build-Depends: debhelper-compat (= 11), ed
+Standards-Version: 4.5.1
+Homepage: https://savannah.gnu.org/projects/patch/
+Rules-Requires-Root: no
+
+Package: patch
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Suggests: ed, diffutils-doc
+Multi-Arch: foreign
+Architecture: any
+Description: Apply a diff file to an original
+ Patch will take a patch file containing any of the four forms
+ of difference listing produced by the diff program and apply
+ those differences to an original file, producing a patched
+ version.
