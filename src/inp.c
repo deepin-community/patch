@@ -1,8 +1,7 @@
 /* inputting files to be patched */
 
-/* Copyright (C) 1986, 1988 Larry Wall
-   Copyright (C) 1991-1993, 1997-1999, 2002-2003, 2006, 2009-2012 Free Software
-   Foundation, Inc.
+/* Copyright 1991-2025 Free Software Foundation, Inc.
+   Copyright 1986, 1988 Larry Wall
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -17,80 +16,34 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
 
-#define XTERN extern
 #include <common.h>
+
 #include <quotearg.h>
 #include <util.h>
 #include <xalloc.h>
-#undef XTERN
-#define XTERN
+
 #include <inp.h>
 #include <safe.h>
 
 /* Input-file-with-indexable-lines abstract type */
 
-static char *i_buffer;			/* plan A buffer */
-static char const **i_ptr;		/* pointers to lines in plan A buffer */
+static char *i_buffer;			/* buffer of input file lines */
+static char const **i_ptr;		/* pointers to lines in buffer */
+idx_t input_lines;			/* how long is input file in lines */
 
-static size_t tibufsize;		/* size of plan b buffers */
-#ifndef TIBUFSIZE_MINIMUM
-#define TIBUFSIZE_MINIMUM (8 * 1024)	/* minimum value for tibufsize */
-#endif
-static int tifd = -1;			/* plan b virtual string array */
-static char *tibuf[2];			/* plan b buffers */
-static lin tiline[2] = {-1, -1};	/* 1st line in each buffer */
-static lin lines_per_buf;		/* how many lines per buffer */
-static size_t tireclen;			/* length of records in tmp file */
-static size_t last_line_size;		/* size of last input line */
-
-static bool plan_a (char const *);	/* yield false if memory runs out */
-static void plan_b (char const *);
 static void report_revision (bool);
-static void too_many_lines (char const *) __attribute__((noreturn));
-static void lines_too_long (char const *) __attribute__((noreturn));
 
 /* New patch--prepare to edit another file. */
 
 void
 re_input (void)
 {
-    if (using_plan_a) {
       if (i_buffer)
 	{
 	  free (i_buffer);
 	  i_buffer = 0;
 	  free (i_ptr);
 	}
-    }
-    else {
-	if (tifd >= 0)
-	  close (tifd);
-	tifd = -1;
-	if (tibuf[0])
-	  {
-	    free (tibuf[0]);
-	    tibuf[0] = 0;
-	  }
-	tiline[0] = tiline[1] = -1;
-	tireclen = 0;
-    }
-}
-
-/* Construct the line index, somehow or other. */
-
-void
-scan_input (char *filename, mode_t file_type)
-{
-    using_plan_a = ! (debug & 16) && plan_a (filename);
-    if (!using_plan_a)
-      {
-	if (! S_ISREG (file_type))
-	  {
-	    assert (S_ISLNK (file_type));
-	    fatal ("Can't handle %s %s", "symbolic link", quotearg (filename));
-	  }
-	plan_b(filename);
-      }
 }
 
 /* Report whether a desired revision was found.  */
@@ -116,28 +69,16 @@ report_revision (bool found_revision)
 	   rev);
   else
     {
-      ask ("This file doesn't appear to be the %s version -- patch anyway? [n] ",
-	   rev);
-      if (*buf != 'y')
+      if (*ask (("This file doesn't appear to be the %s version"
+		 " -- patch anyway? [n] "),
+		rev)
+	  != 'y')
 	fatal ("aborted");
     }
 }
 
-
-static void
-too_many_lines (char const *filename)
-{
-  fatal ("File %s has too many lines", quotearg (filename));
-}
-
-static void
-lines_too_long (char const *filename)
-{
-  fatal ("Lines in file %s are too long", quotearg (filename));
-}
-
 bool
-get_input_file (char const *filename, char const *outname, mode_t file_type)
+get_input_file (char *filename, char const *outname, mode_t file_type)
 {
     bool elsewhere = strcmp (filename, outname) != 0;
     char const *cs;
@@ -214,38 +155,29 @@ get_input_file (char const *filename, char const *outname, mode_t file_type)
 }
 
 
-/* Try keeping everything in memory. */
+/* Read input and build its line index.  */
 
-static bool
-plan_a (char const *filename)
+void
+scan_input (char *filename, mode_t file_type, int ifd)
 {
-  char const *s;
-  char const *lim;
-  char const **ptr;
-  char *buffer;
-  lin iline;
-  size_t size = instat.st_size;
-
-  /* Fail if the file size doesn't fit in a size_t,
+  /* Fail if the file size doesn't fit,
      or if storage isn't available.  */
-  if (! (size == instat.st_size
-	 && (buffer = malloc (size ? size : (size_t) 1))))
-    return false;
+  idx_t size;
+  if (ckd_add (&size, instat.st_size, 0))
+    xalloc_die ();
+  char *buffer = ximalloc (size);
 
   /* Read the input file, but don't bother reading it if it's empty.
      When creating files, the files do not actually exist.  */
   if (size)
     {
-      if (S_ISREG (instat.st_mode))
+      if (S_ISREG (file_type))
         {
-	  int ifd = safe_open (filename, O_RDONLY|binary_transput, 0);
-	  size_t buffered = 0, n;
-	  if (ifd < 0)
-	    pfatal ("can't open file %s", quotearg (filename));
+	  idx_t buffered = 0;
 
 	  while (size - buffered != 0)
 	    {
-	      n = read (ifd, buffer + buffered, size - buffered);
+	      ssize_t n = Read (ifd, buffer + buffered, size - buffered);
 	      if (n == 0)
 		{
 		  /* Some non-POSIX hosts exaggerate st_size in text mode;
@@ -253,52 +185,30 @@ plan_a (char const *filename)
 		  size = buffered;
 		  break;
 		}
-	      if (n == (size_t) -1)
-		{
-		  /* Perhaps size is too large for this host.  */
-		  close (ifd);
-		  free (buffer);
-		  return false;
-		}
 	      buffered += n;
 	    }
-
-	  if (close (ifd) != 0)
-	    read_fatal ();
 	}
-      else if (S_ISLNK (instat.st_mode))
+      else
 	{
-	  ssize_t n;
-	  n = safe_readlink (filename, buffer, size);
+	  ssize_t n = safe_readlink (filename, buffer, size);
 	  if (n < 0)
 	    pfatal ("can't read %s %s", "symbolic link", quotearg (filename));
 	  size = n;
 	}
-      else
-	{
-	  free (buffer);
-	  return false;
-	}
   }
 
   /* Scan the buffer and build array of pointers to lines.  */
-  lim = buffer + size;
-  iline = 3; /* 1 unused, 1 for SOF, 1 for EOF if last line is incomplete */
-  for (s = buffer;  (s = (char *) memchr (s, '\n', lim - s));  s++)
-    if (++iline < 0)
-      too_many_lines (filename);
-  if (! (iline == (size_t) iline
-	 && (size_t) iline * sizeof *ptr / sizeof *ptr == (size_t) iline
-	 && (ptr = (char const **) malloc ((size_t) iline * sizeof *ptr))))
-    {
-      free (buffer);
-      return false;
-    }
+  char const *lim = buffer + size;
+  idx_t iline = 3; /* 1 unused, 1 for SOF,
+		      1 for EOF if last line is incomplete.  */
+  for (char const *s = buffer;  (s = memchr (s, '\n', lim - s));  s++)
+    iline++;
+  char const **ptr = xireallocarray (nullptr, iline, sizeof *ptr);
   iline = 0;
-  for (s = buffer;  ;  s++)
+  for (char const *s = buffer; ; s++)
     {
       ptr[++iline] = s;
-      if (! (s = (char *) memchr (s, '\n', lim - s)))
+      if (! (s = memchr (s, '\n', lim - s)))
 	break;
     }
   if (size && lim[-1] != '\n')
@@ -308,18 +218,18 @@ plan_a (char const *filename)
   if (revision)
     {
       char const *rev = revision;
-      int rev0 = rev[0];
+      char rev0 = rev[0];
       bool found_revision = false;
-      size_t revlen = strlen (rev);
+      idx_t revlen = strlen (rev);
 
       if (revlen <= size)
 	{
 	  char const *limrev = lim - revlen;
 
-	  for (s = buffer;  (s = (char *) memchr (s, rev0, limrev - s));  s++)
+	  for (char const *s = buffer; (s = memchr (s, rev0, limrev - s)); s++)
 	    if (memcmp (s, rev, revlen) == 0
-		&& (s == buffer || ISSPACE ((unsigned char) s[-1]))
-		&& (s + 1 == limrev || ISSPACE ((unsigned char) s[revlen])))
+		&& (s == buffer || c_isspace (s[-1]))
+		&& (s + 1 == limrev || c_isspace (s[revlen])))
 	      {
 		found_revision = true;
 		break;
@@ -329,169 +239,18 @@ plan_a (char const *filename)
       report_revision (found_revision);
     }
 
-  /* Plan A will work.  */
   i_buffer = buffer;
   i_ptr = ptr;
-  return true;
 }
 
-/* Keep (virtually) nothing in memory. */
+/* Fetch a line from the input file.  */
 
-static void
-plan_b (char const *filename)
+struct iline
+ifetch (idx_t line)
 {
-  int ifd;
-  FILE *ifp;
-  int c;
-  size_t len;
-  size_t maxlen;
-  bool found_revision;
-  size_t i;
-  char const *rev;
-  size_t revlen;
-  lin line = 1;
+  if (! (1 <= line && line <= input_lines))
+    return (struct iline) { .ptr = "", .size = 0 };
 
-  if (instat.st_size == 0)
-    filename = NULL_DEVICE;
-  if ((ifd = safe_open (filename, O_RDONLY | binary_transput, 0)) < 0
-      || ! (ifp = fdopen (ifd, binary_transput ? "rb" : "r")))
-    pfatal ("Can't open file %s", quotearg (filename));
-  if (TMPINNAME_needs_removal)
-    {
-      /* Reopen the existing temporary file. */
-      tifd = create_file (TMPINNAME, O_RDWR | O_BINARY, 0, true);
-    }
-  else
-    {
-      tifd = make_tempfile (&TMPINNAME, 'i', NULL, O_RDWR | O_BINARY,
-			    S_IRUSR | S_IWUSR);
-      if (tifd == -1)
-	pfatal ("Can't create temporary file %s", TMPINNAME);
-      TMPINNAME_needs_removal = true;
-    }
-  i = 0;
-  len = 0;
-  maxlen = 1;
-  rev = revision;
-  found_revision = !rev;
-  revlen = rev ? strlen (rev) : 0;
-
-  while ((c = getc (ifp)) != EOF)
-    {
-      if (++len > ((size_t) -1) / 2)
-	lines_too_long (filename);
-
-      if (c == '\n')
-	{
-	  if (++line < 0)
-	    too_many_lines (filename);
-	  if (maxlen < len)
-	      maxlen = len;
-	  len = 0;
-	}
-
-      if (!found_revision)
-	{
-	  if (i == revlen)
-	    {
-	      found_revision = ISSPACE ((unsigned char) c);
-	      i = (size_t) -1;
-	    }
-	  else if (i != (size_t) -1)
-	    i = rev[i]==c ? i + 1 : (size_t) -1;
-
-	  if (i == (size_t) -1  &&  ISSPACE ((unsigned char) c))
-	    i = 0;
-	}
-    }
-
-  if (revision)
-    report_revision (found_revision);
-  Fseek (ifp, 0, SEEK_SET);		/* rewind file */
-  for (tibufsize = TIBUFSIZE_MINIMUM;  tibufsize < maxlen;  tibufsize <<= 1)
-    /* do nothing */ ;
-  lines_per_buf = tibufsize / maxlen;
-  tireclen = maxlen;
-  tibuf[0] = xmalloc (2 * tibufsize);
-  tibuf[1] = tibuf[0] + tibufsize;
-
-  for (line = 1; ; line++)
-    {
-      char *p = tibuf[0] + maxlen * (line % lines_per_buf);
-      char const *p0 = p;
-      if (! (line % lines_per_buf))	/* new block */
-	if (write (tifd, tibuf[0], tibufsize) != tibufsize)
-	  write_fatal ();
-      if ((c = getc (ifp)) == EOF)
-	break;
-
-      for (;;)
-	{
-	  *p++ = c;
-	  if (c == '\n')
-	    {
-	      last_line_size = p - p0;
-	      break;
-	    }
-
-	  if ((c = getc (ifp)) == EOF)
-	    {
-	      last_line_size = p - p0;
-	      line++;
-	      goto EOF_reached;
-	    }
-	}
-    }
- EOF_reached:
-  if (ferror (ifp)  ||  fclose (ifp) != 0)
-    read_fatal ();
-
-  if (line % lines_per_buf  !=  0)
-    if (write (tifd, tibuf[0], tibufsize) != tibufsize)
-      write_fatal ();
-  input_lines = line - 1;
-}
-
-/* Fetch a line from the input file.
-   WHICHBUF is ignored when the file is in memory.  */
-
-char const *
-ifetch (lin line, bool whichbuf, size_t *psize)
-{
-    char const *q;
-    char const *p;
-
-    if (line < 1 || line > input_lines) {
-	*psize = 0;
-	return "";
-    }
-    if (using_plan_a) {
-	p = i_ptr[line];
-	*psize = i_ptr[line + 1] - p;
-	return p;
-    } else {
-	lin offline = line % lines_per_buf;
-	lin baseline = line - offline;
-
-	if (tiline[0] == baseline)
-	    whichbuf = false;
-	else if (tiline[1] == baseline)
-	    whichbuf = true;
-	else {
-	    tiline[whichbuf] = baseline;
-	    if ((lseek (tifd, baseline/lines_per_buf * tibufsize, SEEK_SET)
-		 == -1)
-		|| read (tifd, tibuf[whichbuf], tibufsize) < 0)
-	      read_fatal ();
-	}
-	p = tibuf[whichbuf] + (tireclen*offline);
-	if (line == input_lines)
-	    *psize = last_line_size;
-	else {
-	    for (q = p;  *q++ != '\n';  )
-		/* do nothing */ ;
-	    *psize = q - p;
-	}
-	return p;
-    }
+  char const *ptr = i_ptr[line];
+  return (struct iline) { .ptr = ptr, .size = i_ptr[line + 1] - ptr };
 }

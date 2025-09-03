@@ -1,9 +1,9 @@
 /* provide a replacement openat function
-   Copyright (C) 2004-2018 Free Software Foundation, Inc.
+   Copyright (C) 2004-2025 Free Software Foundation, Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -35,17 +35,21 @@ orig_openat (int fd, char const *filename, int flags, mode_t mode)
 }
 #endif
 
+#ifdef __osf__
 /* Write "fcntl.h" here, not <fcntl.h>, otherwise OSF/1 5.1 DTK cc eliminates
    this include because of the preliminary #include <fcntl.h> above.  */
-#include "fcntl.h"
+# include "fcntl.h"
+#else
+# include <fcntl.h>
+#endif
 
 #include "openat.h"
 
 #include "cloexec.h"
 
 #include <stdarg.h>
-#include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -57,17 +61,8 @@ orig_openat (int fd, char const *filename, int flags, mode_t mode)
 int
 rpl_openat (int dfd, char const *filename, int flags, ...)
 {
-  /* 0 = unknown, 1 = yes, -1 = no.  */
-#if GNULIB_defined_O_CLOEXEC
-  int have_cloexec = -1;
-#else
-  static int have_cloexec;
-#endif
+  mode_t mode = 0;
 
-  mode_t mode;
-  int fd;
-
-  mode = 0;
   if (flags & O_CREAT)
     {
       va_list arg;
@@ -81,28 +76,27 @@ rpl_openat (int dfd, char const *filename, int flags, ...)
     }
 
 # if OPEN_TRAILING_SLASH_BUG
-  /* If the filename ends in a slash and one of O_CREAT, O_WRONLY, O_RDWR
-     is specified, then fail.
-     Rationale: POSIX <http://www.opengroup.org/susv3/basedefs/xbd_chap04.html>
-     says that
-       "A pathname that contains at least one non-slash character and that
-        ends with one or more trailing slashes shall be resolved as if a
-        single dot character ( '.' ) were appended to the pathname."
-     and
-       "The special filename dot shall refer to the directory specified by
-        its predecessor."
+  /* Fail if one of O_CREAT, O_WRONLY, O_RDWR is specified and the filename
+     ends in a slash, as POSIX says such a filename must name a directory
+     <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_13>:
+       "A pathname that contains at least one non-<slash> character and that
+        ends with one or more trailing <slash> characters shall not be resolved
+        successfully unless the last pathname component before the trailing
+        <slash> characters names an existing directory"
      If the named file already exists as a directory, then
        - if O_CREAT is specified, open() must fail because of the semantics
          of O_CREAT,
        - if O_WRONLY or O_RDWR is specified, open() must fail because POSIX
-         <http://www.opengroup.org/susv3/functions/open.html> says that it
-         fails with errno = EISDIR in this case.
+         <https://pubs.opengroup.org/onlinepubs/9699919799/functions/openat.html>
+         says that it fails with errno = EISDIR in this case.
      If the named file does not exist or does not name a directory, then
        - if O_CREAT is specified, open() must fail since open() cannot create
          directories,
        - if O_WRONLY or O_RDWR is specified, open() must fail because the
          file does not contain a '.' directory.  */
-  if (flags & (O_CREAT | O_WRONLY | O_RDWR))
+  if ((flags & O_CREAT)
+      || (flags & O_ACCMODE) == O_RDWR
+      || (flags & O_ACCMODE) == O_WRONLY)
     {
       size_t len = strlen (filename);
       if (len > 0 && filename[len - 1] == '/')
@@ -113,8 +107,15 @@ rpl_openat (int dfd, char const *filename, int flags, ...)
     }
 # endif
 
-  fd = orig_openat (dfd, filename,
-                    flags & ~(have_cloexec <= 0 ? O_CLOEXEC : 0), mode);
+  /* 0 = unknown, 1 = yes, -1 = no.  */
+#if GNULIB_defined_O_CLOEXEC
+  int have_cloexec = -1;
+#else
+  static int have_cloexec;
+#endif
+
+  int fd = orig_openat (dfd, filename,
+                        flags & ~(have_cloexec < 0 ? O_CLOEXEC : 0), mode);
 
   if (flags & O_CLOEXEC)
     {
@@ -136,14 +137,12 @@ rpl_openat (int dfd, char const *filename, int flags, ...)
 # if OPEN_TRAILING_SLASH_BUG
   /* If the filename ends in a slash and fd does not refer to a directory,
      then fail.
-     Rationale: POSIX <http://www.opengroup.org/susv3/basedefs/xbd_chap04.html>
-     says that
-       "A pathname that contains at least one non-slash character and that
-        ends with one or more trailing slashes shall be resolved as if a
-        single dot character ( '.' ) were appended to the pathname."
-     and
-       "The special filename dot shall refer to the directory specified by
-        its predecessor."
+     Rationale: POSIX says such a filename must name a directory
+     <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_13>:
+       "A pathname that contains at least one non-<slash> character and that
+        ends with one or more trailing <slash> characters shall not be resolved
+        successfully unless the last pathname component before the trailing
+        <slash> characters names an existing directory"
      If the named file without the slash is not a directory, open() must fail
      with ENOTDIR.  */
   if (fd >= 0)
@@ -169,7 +168,7 @@ rpl_openat (int dfd, char const *filename, int flags, ...)
 
 #else /* !HAVE_OPENAT */
 
-# include "dosname.h" /* solely for definition of IS_ABSOLUTE_FILE_NAME */
+# include "filename.h" /* solely for definition of IS_ABSOLUTE_FILE_NAME */
 # include "openat-priv.h"
 # include "save-cwd.h"
 
@@ -216,11 +215,6 @@ int
 openat_permissive (int fd, char const *file, int flags, mode_t mode,
                    int *cwd_errno)
 {
-  struct saved_cwd saved_cwd;
-  int saved_errno;
-  int err;
-  bool save_ok;
-
   if (fd == AT_FDCWD || IS_ABSOLUTE_FILE_NAME (file))
     return open (file, flags, mode);
 
@@ -244,41 +238,55 @@ openat_permissive (int fd, char const *file, int flags, mode_t mode,
       }
   }
 
-  save_ok = (save_cwd (&saved_cwd) == 0);
-  if (! save_ok)
+  struct saved_cwd saved_cwd;
+  int save_failed = save_cwd (&saved_cwd) < 0 ? errno : 0;
+
+  /* If save_cwd allocated a descriptor DFD other than FD, do another
+     save_cwd and then close DFD, so that the later open (if successful)
+     returns DFD (the lowest-numbered descriptor) as POSIX requires.  */
+  int dfd = saved_cwd.desc;
+  if (0 <= dfd && dfd != fd)
     {
-      if (! cwd_errno)
-        openat_save_fail (errno);
-      *cwd_errno = errno;
+      save_failed = save_cwd (&saved_cwd) < 0 ? errno : 0;
+      close (dfd);
+      dfd = saved_cwd.desc;
     }
-  if (0 <= fd && fd == saved_cwd.desc)
+
+  /* If saving the working directory collides with the user's requested fd,
+     then the user's fd must have been closed to begin with.  */
+  if (0 <= dfd && dfd == fd)
     {
-      /* If saving the working directory collides with the user's
-         requested fd, then the user's fd must have been closed to
-         begin with.  */
       free_cwd (&saved_cwd);
       errno = EBADF;
       return -1;
     }
 
-  err = fchdir (fd);
-  saved_errno = errno;
+  if (save_failed)
+    {
+      if (! cwd_errno)
+        openat_save_fail (save_failed);
+      *cwd_errno = save_failed;
+    }
 
-  if (! err)
+  int err = fchdir (fd);
+  int saved_errno = errno;
+
+  if (0 <= err)
     {
       err = open (file, flags, mode);
       saved_errno = errno;
-      if (save_ok && restore_cwd (&saved_cwd) != 0)
+      if (!save_failed && restore_cwd (&saved_cwd) < 0)
         {
+          int restore_cwd_errno = errno;
           if (! cwd_errno)
             {
-              /* Don't write a message to just-created fd 2.  */
-              saved_errno = errno;
-              if (err == STDERR_FILENO)
+              /* Do not leak ERR.  This also stops openat_restore_fail
+                 from messing up if ERR happens to equal STDERR_FILENO.  */
+              if (0 <= err)
                 close (err);
-              openat_restore_fail (saved_errno);
+              openat_restore_fail (restore_cwd_errno);
             }
-          *cwd_errno = errno;
+          *cwd_errno = restore_cwd_errno;
         }
     }
 
@@ -293,7 +301,7 @@ bool
 openat_needs_fchdir (void)
 {
   bool needs_fchdir = true;
-  int fd = open ("/", O_SEARCH);
+  int fd = open ("/", O_SEARCH | O_CLOEXEC);
 
   if (0 <= fd)
     {

@@ -1,6 +1,6 @@
 --- a/src/patch.c
 +++ b/src/patch.c
-@@ -684,7 +684,7 @@
+@@ -750,7 +750,7 @@
  }
  
  static char const shortopts[] = "bB:cd:D:eEfF:g:i:l"

@@ -1,10 +1,10 @@
 /* Program name management.
-   Copyright (C) 2001-2003, 2005-2018 Free Software Foundation, Inc.
+   Copyright (C) 2001-2003, 2005-2025 Free Software Foundation, Inc.
    Written by Bruno Haible <bruno@clisp.org>, 2001.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -63,12 +63,8 @@ set_program_name (const char *argv0)
       argv0 = base;
       if (strncmp (base, "lt-", 3) == 0)
         {
-          argv0 = base + 3;
-          /* On glibc systems, remove the "lt-" prefix from the variable
-             program_invocation_short_name.  */
-#if HAVE_DECL_PROGRAM_INVOCATION_SHORT_NAME
-          program_invocation_short_name = (char *) argv0;
-#endif
+          base += 3;
+          argv0 = base;
         }
     }
 
@@ -88,5 +84,8 @@ set_program_name (const char *argv0)
      as well.  */
 #if HAVE_DECL_PROGRAM_INVOCATION_NAME
   program_invocation_name = (char *) argv0;
+#endif
+#if HAVE_DECL_PROGRAM_INVOCATION_SHORT_NAME
+  program_invocation_short_name = (char *) base;
 #endif
 }

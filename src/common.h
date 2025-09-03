@@ -1,9 +1,7 @@
 /* common definitions for 'patch' */
 
-/* Copyright (C) 1986, 1988 Larry Wall
-
-   Copyright (C) 1990-1993, 1997-1999, 2002-2003, 2006, 2009-2012 Free Software
-   Foundation, Inc.
+/* Copyright 1990-2025 Free Software Foundation, Inc.
+   Copyright 1986, 1988 Larry Wall
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -24,40 +22,26 @@
 
 #include <config.h>
 
+#include <attribute.h>
+#include <c-ctype.h>
+#include <idx.h>
+#include <intprops.h>
+#include <progname.h>
+#include <minmax.h>
+
 #include <assert.h>
-#include <stdbool.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdckdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
-
-#include <sys/stat.h>
-
-#include <limits.h>
-
-#if HAVE_INTTYPES_H
-# include <inttypes.h>
-#elif HAVE_STDINT_H
-# include <stdint.h>
-#endif
-#include <intprops.h>
-
-#include <ctype.h>
-/* CTYPE_DOMAIN (C) is nonzero if the unsigned char C can safely be given
-   as an argument to <ctype.h> macros like 'isspace'.  */
-#if STDC_HEADERS
-#define CTYPE_DOMAIN(c) 1
-#else
-#define CTYPE_DOMAIN(c) ((unsigned) (c) <= 0177)
-#endif
-#ifndef ISSPACE
-#define ISSPACE(c) (CTYPE_DOMAIN (c) && isspace (c))
-#endif
-
-#ifndef ISDIGIT
-#define ISDIGIT(c) ((unsigned) (c) - '0' <= 9)
-#endif
-
-#include <progname.h>
+#include <unistd.h>
 
 /* handy definitions */
 
@@ -67,55 +51,60 @@
 
 /* typedefs */
 
-typedef off_t lin;			/* must be signed */
+/* A description of an output file.  It may be temporary.  */
+struct outfile
+{
+  /* Name of the file.  */
+  char *name;
 
-#define LINENUM_MIN TYPE_MINIMUM (lin)
-#define LINENUM_MAX TYPE_MAXIMUM (lin)
+  /* Equal to NAME if the file exists; otherwise a null pointer.
+     When non-null, the storage it points to is safe to access in
+     a signal handler.  */
+  char volatile *volatile exists;
+
+  /* Equal to NAME if NAME should be freed when this structure is
+     freed or reused; otherwise, a null pointer.  */
+  char *alloc;
+
+  /* Whether the file is intended to be temporary, and therefore
+     should be cleaned up before exit, if it exists.  */
+  bool temporary;
+};
 
 /* globals */
 
-XTERN char *buf;			/* general purpose buffer */
-XTERN size_t bufsize;			/* allocated size of buf */
+extern char *inname;
+extern char *outfile;
+extern int inerrno;
+extern signed char invc;
+extern struct stat instat;
+extern bool dry_run;
+extern bool posixly_correct;
 
-XTERN bool using_plan_a;		/* try to keep everything in memory */
+extern char const *origprae;
+extern char const *origbase;
+extern char const *origsuff;
 
-XTERN char *inname;
-XTERN char *outfile;
-XTERN int inerrno;
-XTERN int invc;
-XTERN struct stat instat;
-XTERN bool dry_run;
-XTERN bool posixly_correct;
+extern struct outfile tmped;
+extern struct outfile tmppat;
 
-XTERN char const *origprae;
-XTERN char const *origbase;
-XTERN char const *origsuff;
-
-XTERN char const * TMPINNAME;
-XTERN char const * TMPOUTNAME;
-XTERN char const * TMPPATNAME;
-
-XTERN bool TMPINNAME_needs_removal;
-XTERN bool TMPOUTNAME_needs_removal;
-XTERN bool TMPPATNAME_needs_removal;
-
-#ifdef DEBUGGING
-XTERN int debug;
+#if DEBUGGING
+extern unsigned short int debug;
 #else
 # define debug 0
 #endif
-XTERN bool force;
-XTERN bool batch;
-XTERN bool noreverse;
-XTERN bool reverse;
-XTERN enum { DEFAULT_VERBOSITY, SILENT, VERBOSE } verbosity;
-XTERN bool skip_rest_of_patch;
-XTERN int strippath;
-XTERN bool canonicalize_ws;
-XTERN int patch_get;
-XTERN bool set_time;
-XTERN bool set_utc;
-XTERN bool follow_symlinks;
+extern bool force;
+extern bool batch;
+extern bool noreverse_flag;
+extern bool reverse_flag;
+extern enum verbosity { DEFAULT_VERBOSITY, SILENT, VERBOSE } verbosity;
+extern bool skip_rest_of_patch;
+extern intmax_t strippath;
+extern bool canonicalize_ws;
+extern intmax_t patch_get;
+extern bool set_time;
+extern bool set_utc;
+extern bool follow_symlinks;
 
 enum diff
   {
@@ -128,42 +117,12 @@ enum diff
     GIT_BINARY_DIFF
   };
 
-XTERN enum diff diff_type;
+extern enum diff diff_type;
 
-XTERN char *revision;			/* prerequisite revision, if any */
+extern char *revision;			/* prerequisite revision, if any */
 
-#ifndef __attribute__
-/* The __attribute__ feature is available in gcc versions 2.5 and later.
-   The __-protected variants of the attributes 'format' and 'printf' are
-   accepted by gcc versions 2.6.4 (effectively 2.7) and later.
-   We enable __attribute__ only if these are supported too, because
-   gnulib and libintl do '#define printf __printf__' when they override
-   the 'printf' function.  */
-# if __GNUC__ < 2 || (__GNUC__ == 2 && __GNUC_MINOR__ < 7)
-#  define __attribute__(Spec)   /* empty */
-# endif
-#endif
-
-void fatal_exit (int) __attribute__ ((noreturn));
-
-#include <errno.h>
-#if !STDC_HEADERS && !defined errno
-extern int errno;
-#endif
-
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-
-#if HAVE_FSEEKO
-  typedef off_t file_offset;
-# define file_seek fseeko
-# define file_tell ftello
-#else
-  typedef long file_offset;
-# define file_seek fseek
-# define file_tell ftell
-#endif
+void fatal_cleanup (void);
+_Noreturn void fatal_exit (void);
 
 #if ! (HAVE_GETEUID || defined geteuid)
 # if ! (HAVE_GETUID || defined getuid)
@@ -173,16 +132,14 @@ extern int errno;
 # endif
 #endif
 
-#include <fcntl.h>
-
 #ifdef HAVE_SETMODE_DOS
-  XTERN int binary_transput;	/* O_BINARY if binary i/o is desired */
+  extern int binary_transput;	/* O_BINARY if binary i/o is desired */
 #else
 # define binary_transput 0
 #endif
 
 /* Disable the CR stripping heuristic?  */
-XTERN bool no_strip_trailing_cr;
+extern bool no_strip_trailing_cr;
 
 #ifndef NULL_DEVICE
 #define NULL_DEVICE "/dev/null"
@@ -201,20 +158,20 @@ struct outstate
 };
 
 /* offset in the input and output at which the previous hunk matched */
-XTERN lin in_offset;
-XTERN lin out_offset;
+extern ptrdiff_t in_offset;
+extern ptrdiff_t out_offset;
 
 /* how many input lines have been irretractably output */
-XTERN lin last_frozen_line;
+extern idx_t last_frozen_line;
 
-bool copy_till (struct outstate *, lin);
-bool similar (char const *, size_t, char const *, size_t) _GL_ATTRIBUTE_PURE;
+bool copy_till (struct outstate *, idx_t);
+bool similar (char const *, idx_t, char const *, idx_t) ATTRIBUTE_PURE;
 
 #ifdef ENABLE_MERGE
 enum conflict_style { MERGE_MERGE, MERGE_DIFF3 };
-XTERN enum conflict_style conflict_style;
+extern enum conflict_style conflict_style;
 
-bool merge_hunk (int hunk, struct outstate *, lin where, bool *);
+bool merge_hunk (intmax_t hunk, struct outstate *, idx_t where, bool *);
 #else
 # define merge_hunk(hunk, outstate, where, somefailed) false
 #endif

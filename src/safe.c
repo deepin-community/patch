@@ -1,6 +1,6 @@
 /* safe path traversal functions for 'patch' */
 
-/* Copyright (C) 2015 Free Software Foundation, Inc.
+/* Copyright 2015-2025 Free Software Foundation, Inc.
 
    Written by Tim Waugh <twaugh@redhat.com> and
    Andreas Gruenbacher <agruenba@redhat.com>.
@@ -28,25 +28,31 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#include <alloca.h>
 #include <safe.h>
-#include "dirname.h"
 
+#include <basename-lgpl.h>
 #include <hash.h>
+#include <filename.h>
 #include <xalloc.h>
-#include <minmax.h>
 
-#define XTERN extern
 #include "common.h"
 
 #include "util.h"
+
+#define LIST_INLINE _GL_EXTERN_INLINE
 #include "list.h"
 
 #ifndef EFTYPE
 # define EFTYPE 0
 #endif
 
-static const unsigned int MAX_PATH_COMPONENTS = 1024;
+#ifdef O_PATH
+enum { O_PATHSEARCH = O_PATH };
+#else
+enum { O_PATHSEARCH = O_SEARCH };
+#endif
+
+enum { MAX_PATH_COMPONENTS = 1024 };
 
 /* Flag to turn the safe_* functions into their unsafe variants; files may then
    lie outside the current working directory. */
@@ -55,7 +61,7 @@ bool unsafe;
 /* Path lookup results are cached in a hash table + LRU list. When the
    cache is full, the oldest entries are removed.  */
 
-unsigned int dirfd_cache_misses;
+static intmax_t dirfd_cache_misses;
 
 struct cached_dirfd {
   struct list_head lru_link;
@@ -66,9 +72,10 @@ struct cached_dirfd {
   int fd;
 };
 
-static Hash_table *cached_dirfds = NULL;
-static size_t max_cached_fds;
-LIST_HEAD (lru_list);
+static Hash_table *cached_dirfds;
+static rlim_t min_cached_fds = 8;
+static rlim_t max_cached_fds;
+static LIST_HEAD (lru_list);
 
 static size_t hash_cached_dirfd (const void *entry, size_t table_size)
 {
@@ -98,15 +105,19 @@ static void init_dirfd_cache (void)
 {
   struct rlimit nofile;
 
-  max_cached_fds = 8;
   if (getrlimit (RLIMIT_NOFILE, &nofile) == 0)
-    max_cached_fds = MAX (nofile.rlim_cur / 4, max_cached_fds);
+    {
+      if (nofile.rlim_cur == RLIM_INFINITY)
+        max_cached_fds = RLIM_INFINITY;
+      else
+	max_cached_fds = MAX (nofile.rlim_cur / 4, min_cached_fds);
+    }
+  else
+    max_cached_fds = min_cached_fds;
 
-  cached_dirfds = hash_initialize (max_cached_fds,
-				   NULL,
+  cached_dirfds = hash_initialize (min_cached_fds, nullptr,
 				   hash_cached_dirfd,
-				   compare_cached_dirfds,
-				   NULL);
+				   compare_cached_dirfds, nullptr);
 
   if (!cached_dirfds)
     xalloc_die ();
@@ -114,7 +125,7 @@ static void init_dirfd_cache (void)
 
 static struct cached_dirfd *lookup_cached_dirfd (struct cached_dirfd *dir, const char *name)
 {
-  struct cached_dirfd *entry = NULL;
+  struct cached_dirfd *entry = nullptr;
 
   if (cached_dirfds)
     {
@@ -132,41 +143,48 @@ static void remove_cached_dirfd (struct cached_dirfd *entry)
   while (! list_empty (&entry->children))
     {
       struct cached_dirfd *child =
-	list_entry (entry->children.next, struct cached_dirfd, children_link);
+	list_entry (entry->children.next,
+		    offsetof (struct cached_dirfd, children_link));
       list_del_init (&child->children_link);
       /* assert (list_empty (&child->children_link)); */
-      hash_delete (cached_dirfds, child);  /* noop when not hashed */
+      hash_remove (cached_dirfds, child);  /* noop when not hashed */
     }
   list_del (&entry->lru_link);
-  hash_delete (cached_dirfds, entry);  /* noop when not hashed */
+  hash_remove (cached_dirfds, entry);  /* noop when not hashed */
   close (entry->fd);
   free_cached_dirfd (entry);
 }
 
 static void insert_cached_dirfd (struct cached_dirfd *entry, int keepfd)
 {
-  if (cached_dirfds == NULL)
+  if (!cached_dirfds)
     init_dirfd_cache ();
 
-  /* Trim off the least recently used entries */
-  while (hash_get_n_entries (cached_dirfds) >= max_cached_fds)
+  if (max_cached_fds != RLIM_INFINITY)
     {
-      struct cached_dirfd *last =
-	list_entry (lru_list.prev, struct cached_dirfd, lru_link);
-      if (&last->lru_link == &lru_list)
-	break;
-      if (last->fd == keepfd)
+      /* Trim off the least recently used entries */
+      while (hash_get_n_entries (cached_dirfds) >= max_cached_fds)
 	{
-	  last = list_entry (last->lru_link.prev, struct cached_dirfd, lru_link);
+	  struct cached_dirfd *last =
+	    list_entry (lru_list.prev,
+			offsetof (struct cached_dirfd, lru_link));
 	  if (&last->lru_link == &lru_list)
 	    break;
+	  if (last->fd == keepfd)
+	    {
+	      last = list_entry (last->lru_link.prev,
+				 offsetof (struct cached_dirfd, lru_link));
+	      if (&last->lru_link == &lru_list)
+		break;
+	    }
+	  remove_cached_dirfd (last);
 	}
-      remove_cached_dirfd (last);
     }
 
   /* Only insert if the parent still exists. */
   if (! list_empty (&entry->children_link))
-    assert (hash_insert (cached_dirfds, entry) == entry);
+    if (hash_insert (cached_dirfds, entry) != entry)
+      xalloc_die ();
 }
 
 static void invalidate_cached_dirfd (int dirfd, const char *name)
@@ -201,7 +219,8 @@ static int put_path (struct cached_dirfd *entry)
   return fd;
 }
 
-static struct cached_dirfd *new_cached_dirfd (struct cached_dirfd *dir, const char *name, int fd)
+static struct cached_dirfd *
+new_cached_dirfd (struct cached_dirfd *dir, char *name, int fd)
 {
   struct cached_dirfd *entry = xmalloc (sizeof (struct cached_dirfd));
 
@@ -209,12 +228,17 @@ static struct cached_dirfd *new_cached_dirfd (struct cached_dirfd *dir, const ch
   list_add (&entry->children_link, &dir->children);
   INIT_LIST_HEAD (&entry->children);
   entry->parent = dir;
-  entry->name = xstrdup (name);
+  entry->name = name;
   entry->fd = fd;
   return entry;
 }
 
-static struct cached_dirfd *openat_cached (struct cached_dirfd *dir, const char *name, int keepfd)
+/* In DIR, look up NAME as a subdirectory.
+   Return the corresponding cache entry if found, a null pointer otherwise.
+   If KEEPFD is nonnegative, make sure that any cache entry for it is not
+   removed from the cache (and KEEPFD remains open).  */
+static struct cached_dirfd *
+openat_cached (struct cached_dirfd *dir, char const *name, int keepfd)
 {
   int fd;
   struct cached_dirfd *entry = lookup_cached_dirfd (dir, name);
@@ -223,49 +247,46 @@ static struct cached_dirfd *openat_cached (struct cached_dirfd *dir, const char 
     {
       list_del_init (&entry->lru_link);
       /* assert (list_empty (&entry->lru_link)); */
-      goto out;
+      return entry;
     }
   dirfd_cache_misses++;
 
   /* Actually get the new directory file descriptor. Don't follow
      symbolic links. */
-  fd = openat (dir->fd, name, O_DIRECTORY | O_NOFOLLOW);
+  fd = openat (dir->fd, name, O_PATHSEARCH | O_DIRECTORY | O_NOFOLLOW);
 
   /* Don't cache errors. */
   if (fd < 0)
-    return NULL;
+    return nullptr;
 
   /* Store new cache entry */
-  entry = new_cached_dirfd (dir, name, fd);
+  entry = new_cached_dirfd (dir, xstrdup (name), fd);
   insert_cached_dirfd (entry, keepfd);
-
-out:
   return entry;
 }
 
-_GL_ATTRIBUTE_PURE
-static unsigned int count_path_components (const char *path)
+static idx_t ATTRIBUTE_PURE
+count_path_components (const char *path)
 {
-  unsigned int components;
-
   while (ISSLASH (*path))
     path++;
   if (! *path)
     return 1;
-  for (components = 0; *path; components++)
+  for (idx_t components = 0; ; components++)
     {
+      if (!*path)
+	return components;
       while (*path && ! ISSLASH (*path))
 	path++;
       while (ISSLASH (*path))
 	path++;
     }
-  return components;
 }
 
 /* A symlink to resolve. */
 struct symlink {
   struct symlink *prev;
-  const char *path;
+  char *path;
 };
 
 static void push_symlink (struct symlink **stack, struct symlink *symlink)
@@ -281,8 +302,8 @@ static void pop_symlink (struct symlink **stack)
   free (top);
 }
 
-int cwd_stat_errno = -1;
-struct stat cwd_stat;
+static int cwd_stat_errno = -1;
+static struct stat cwd_stat;
 
 static struct symlink *read_symlink(int dirfd, const char *name)
 {
@@ -296,9 +317,12 @@ static struct symlink *read_symlink(int dirfd, const char *name)
       || ! S_ISLNK (st.st_mode))
     {
       errno = saved_errno;
-      return NULL;
+      return nullptr;
     }
-  symlink = xmalloc (sizeof (*symlink) + st.st_size + 1);
+  idx_t symlinksize;
+  if (ckd_add (&symlinksize, st.st_size, 1 + sizeof *symlink))
+    xalloc_die ();
+  symlink = ximalloc (symlinksize);
   buffer = (char *)(symlink + 1);
   ret = readlinkat (dirfd, name, buffer, st.st_size);
   if (ret <= 0)
@@ -350,68 +374,71 @@ fail_exdev:
   errno = EXDEV;
 fail:
   free (symlink);
-  return NULL;
+  return nullptr;
 }
 
 /* Resolve the next path component in PATH inside DIR.  If it is a symlink,
    read it and returned it in TOP. */
 static struct cached_dirfd *
-traverse_next (struct cached_dirfd *dir, const char **path, int keepfd,
+traverse_next (struct cached_dirfd *dir, char **path, int keepfd,
 	       struct symlink **symlink)
 {
-  const char *p = *path;
+  char *p = *path;
   struct cached_dirfd *entry = dir;
-  char *name;
 
   while (*p && ! ISSLASH (*p))
     p++;
   if (**path == '.' && *path + 1 == p)
-    goto skip;
-  if (**path == '.' && *(*path + 1) == '.' && *path + 2 == p)
+    ;
+  else if (**path == '.' && *(*path + 1) == '.' && *path + 2 == p)
     {
       entry = dir->parent;
       if (! entry)
 	{
 	  /* Must not leave the working tree. */
 	  errno = EXDEV;
-	  goto out;
 	}
-      assert (list_empty (&dir->lru_link));
-      list_add (&dir->lru_link, &lru_list);
-      goto skip;
-    }
-  name = alloca (p - *path + 1);
-  memcpy(name, *path, p - *path);
-  name[p - *path] = 0;
-
-  entry = openat_cached (dir, name, keepfd);
-  if (! entry)
-    {
-      if (errno == ELOOP
-	  || errno == EMLINK  /* FreeBSD 10.1: Too many links */
-	  || errno == EFTYPE  /* NetBSD 6.1: Inappropriate file type or format */
-	  || errno == ENOTDIR)
+      else
 	{
-	  if ((*symlink = read_symlink (dir->fd, name)))
-	    {
-	      entry = dir;
-	      goto skip;
-	    }
-	  errno = ELOOP;
+	  assert (list_empty (&dir->lru_link));
+	  list_add (&dir->lru_link, &lru_list);
 	}
-      goto out;
     }
-skip:
-  while (ISSLASH (*p))
-    p++;
-out:
+  else
+    {
+      char slash_or_nul = *p;
+      *p = '\0';
+      entry = openat_cached (dir, *path, keepfd);
+      if (! entry)
+	{
+	  if (errno == ELOOP
+	      || errno == EMLINK  /* FreeBSD 10.1: Too many links */
+	      || (errno == EFTYPE
+		  /* NetBSD 6.1: Inappropriate file type or format.  */)
+	      || errno == ENOTDIR)
+	    {
+	      *symlink = read_symlink (dir->fd, *path);
+	      if (*symlink)
+		entry = dir;
+	      errno = ELOOP;
+	    }
+	}
+      *p = slash_or_nul;
+    }
+  if (entry)
+    while (ISSLASH (*p))
+      p++;
   *path = p;
   return entry;
 }
 
-/* Traverse PATHNAME.  Updates PATHNAME to point to the last path component and
-   returns a file descriptor to its parent directory (which can be AT_FDCWD).
-   When KEEPFD is given, make sure that the cache entry for DIRFD is not
+/* Traverse PATHNAME.
+
+   If REJECT_NL, fail if the PATHNAME's last component contains a newline.
+   Otherwise, if unsafe or PATHNAME is absolute, just return AT_FDCWD.
+   Otherwise, update PATHNAME to point to the last path component and
+   return a file descriptor to its parent directory (which can be AT_FDCWD).
+   If KEEPFD is nonnegative, make sure that any cache entry for it is not
    removed from the cache (and KEEPFD remains open).
 
    When this function is not running, all cache entries are on the lru list,
@@ -419,59 +446,57 @@ out:
    While this function is running, all cache entries on the path being looked
    up are off the lru list but in the hash table.
     */
-static int traverse_another_path (const char **pathname, int keepfd)
+static int
+traverse_another_path (char **pathname, bool reject_nl, int keepfd)
 {
+  char *path = *pathname;
+  char *last = last_component (path);
+  if (reject_nl && strchr (last, '\n'))
+    {
+      errno = EILSEQ;
+      return DIRFD_INVALID;
+    }
+  if (unsafe || last == path || IS_ABSOLUTE_FILE_NAME (path))
+    return AT_FDCWD;
+
   static struct cached_dirfd cwd = {
     .fd = AT_FDCWD,
   };
 
-  unsigned int misses = dirfd_cache_misses;
-  const char *path = *pathname, *last;
+  intmax_t misses = dirfd_cache_misses;
   struct cached_dirfd *dir = &cwd;
-  struct symlink *stack = NULL;
-  unsigned int steps = count_path_components (path);
-  struct cached_dirfd *traversed_symlink = NULL;
+  struct symlink *stack = nullptr;
+  idx_t steps = count_path_components (path);
+  struct cached_dirfd *traversed_symlink = nullptr;
 
   INIT_LIST_HEAD (&cwd.children);
 
   if (steps > MAX_PATH_COMPONENTS)
     {
       errno = ELOOP;
-      return -1;
+      return DIRFD_INVALID;
     }
-
-  if (! *path || IS_ABSOLUTE_FILE_NAME (path))
-    return AT_FDCWD;
-
-  /* Find the last pathname component */
-  last = strrchr (path, 0) - 1;
-  if (ISSLASH (*last))
-    {
-      while (last != path)
-	if (! ISSLASH (*--last))
-	  break;
-    }
-  while (last != path && ! ISSLASH (*(last - 1)))
-    last--;
-  if (last == path)
-    return AT_FDCWD;
 
   if (debug & 32)
-    printf ("Resolving path \"%.*s\"", (int) (last - path), path);
+    {
+      idx_t full_pathlen = last - path;
+      int pathlen = ckd_sub (&pathlen, full_pathlen, 0) ? -1 : pathlen;
+      Fprintf (stdout, "Resolving path \"%.*s\"", pathlen, path);
+    }
 
   while (stack || path != last)
     {
       struct cached_dirfd *entry;
-      struct symlink *symlink = NULL;
-      const char *prev = path;
+      struct symlink *symlink = nullptr;
+      char *prev = path;
 
       entry = traverse_next (dir, stack ? &stack->path : &path, keepfd, &symlink);
       if (! entry)
 	{
 	  if (debug & 32)
 	    {
-	      printf (" (failed)\n");
-	      fflush (stdout);
+	      Fputs (" (failed)\n", stdout);
+	      Fflush (stdout);
 	    }
 	  goto fail;
 	}
@@ -479,15 +504,10 @@ static int traverse_another_path (const char **pathname, int keepfd)
       if (! stack && symlink)
 	{
 	  const char *p = prev;
-	  char *name;
-
 	  while (*p && ! ISSLASH (*p))
 	    p++;
-	  name = alloca (p - prev + 1);
-	  memcpy (name, prev, p - prev);
-	  name[p - prev] = 0;
-
-	  traversed_symlink = new_cached_dirfd (dir, name, -1);
+	  char *name = ximemdup0 (prev, p - prev);
+	  traversed_symlink = new_cached_dirfd (dir, name, DIRFD_INVALID);
 	}
       if (stack && ! *stack->path)
 	pop_symlink (&stack);
@@ -507,25 +527,25 @@ static int traverse_another_path (const char **pathname, int keepfd)
 	{
 	  traversed_symlink->fd =
 	    entry->fd == AT_FDCWD ? AT_FDCWD : dup (entry->fd);
-	  if (traversed_symlink->fd != -1)
+	  if (traversed_symlink->fd < 0)
+	    free_cached_dirfd (traversed_symlink);
+	  else
 	    {
 	      insert_cached_dirfd (traversed_symlink, keepfd);
 	      list_add (&traversed_symlink->lru_link, &lru_list);
 	    }
-	  else
-	    free_cached_dirfd (traversed_symlink);
-	  traversed_symlink = NULL;
+	  traversed_symlink = nullptr;
 	}
     }
   *pathname = last;
   if (debug & 32)
     {
-      misses = (signed int) dirfd_cache_misses - (signed int) misses;
+      misses = dirfd_cache_misses - misses;
       if (! misses)
-	printf(" (cached)\n");
+	Fprintf (stdout, " (cached)\n");
       else
-	printf (" (%u miss%s)\n", misses, misses == 1 ? "" : "es");
-      fflush (stdout);
+	Fprintf (stdout, " (%jd miss%s)\n", misses, misses == 1 ? "" : "es");
+      Fflush (stdout);
     }
   return put_path (dir);
 
@@ -535,72 +555,75 @@ fail:
   put_path (dir);
   while (stack)
     pop_symlink (&stack);
-  return -1;
+  return DIRFD_INVALID;
 }
 
 /* Just traverse PATHNAME; see traverse_another_path(). */
-static int traverse_path (const char **pathname)
+static int
+traverse_path (char **pathname, bool reject_nl)
 {
-  return traverse_another_path (pathname, -1);
+  return traverse_another_path (pathname, reject_nl, DIRFD_INVALID);
 }
 
-static int safe_xstat (const char *pathname, struct stat *buf, int flags)
+static int
+safe_xstat (char *pathname, struct stat *buf, int flags)
 {
-  int dirfd;
-
-  if (unsafe)
-    return fstatat (AT_FDCWD, pathname, buf, flags);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return fstatat (dirfd, pathname, buf, flags);
 }
 
 /* Replacement for stat() */
-int safe_stat (const char *pathname, struct stat *buf)
+int
+safe_stat (char *pathname, struct stat *buf)
 {
   return safe_xstat (pathname, buf, 0);
 }
 
 /* Replacement for lstat() */
-int safe_lstat (const char *pathname, struct stat *buf)
+int
+safe_lstat (char *pathname, struct stat *buf)
 {
   return safe_xstat (pathname, buf, AT_SYMLINK_NOFOLLOW);
 }
 
 /* Replacement for open() */
-int safe_open (const char *pathname, int flags, mode_t mode)
+int
+safe_open (char *pathname, int flags, mode_t mode)
 {
-  int dirfd;
+  int creat_excl = flags & (O_CREAT | O_EXCL);
+  int dirfd = traverse_path (&pathname, creat_excl == (O_CREAT | O_EXCL));
+  if (dirfd == DIRFD_INVALID)
+    return -1;
 
-  if (unsafe)
-    return open (pathname, flags, mode);
+  /* If O_CREAT is set but O_EXCL is not, traverse_path does not
+     suffice for checking file names with '\n', so check by hand.  */
+  if (creat_excl == O_CREAT
+      && strchr (last_component (pathname), '\n')
+      && faccessat (dirfd, pathname, F_OK, AT_EACCESS) < 0
+      && errno == ENOENT)
+    {
+      errno = EILSEQ;
+      return -1;
+    }
 
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
   return openat (dirfd, pathname, flags, mode);
 }
 
 /* Replacement for rename() */
-int safe_rename (const char *oldpath, const char *newpath)
+int
+safe_rename (char *oldpath, char *newpath)
 {
-  int olddirfd, newdirfd;
-  int ret;
+  int olddirfd = traverse_path (&oldpath, false);
+  if (olddirfd == DIRFD_INVALID)
+    return -1;
 
-  if (unsafe)
-    return rename (oldpath, newpath);
+  int newdirfd = traverse_another_path (&newpath, true, olddirfd);
+  if (newdirfd == DIRFD_INVALID)
+    return -1;
 
-  olddirfd = traverse_path (&oldpath);
-  if (olddirfd < 0 && olddirfd != AT_FDCWD)
-    return olddirfd;
-
-  newdirfd = traverse_another_path (&newpath, olddirfd);
-  if (newdirfd < 0 && newdirfd != AT_FDCWD)
-    return newdirfd;
-
-  ret = renameat (olddirfd, oldpath, newdirfd, newpath);
+  int ret = renameat (olddirfd, oldpath, newdirfd, newpath);
   if (! ret)
     {
       invalidate_cached_dirfd (olddirfd, oldpath);
@@ -610,132 +633,95 @@ int safe_rename (const char *oldpath, const char *newpath)
 }
 
 /* Replacement for mkdir() */
-int safe_mkdir (const char *pathname, mode_t mode)
+int
+safe_mkdir (char *pathname, mode_t mode)
 {
-  int dirfd;
-
-  if (unsafe)
-    return mkdir (pathname, mode);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&pathname, true);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return mkdirat (dirfd, pathname, mode);
 }
 
 /* Replacement for rmdir() */
-int safe_rmdir (const char *pathname)
+int
+safe_rmdir (char *pathname)
 {
-  int dirfd;
-  int ret;
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
 
-  if (unsafe)
-    return rmdir (pathname);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
-
-  ret = unlinkat (dirfd, pathname, AT_REMOVEDIR);
+  int ret = unlinkat (dirfd, pathname, AT_REMOVEDIR);
   if (! ret)
     invalidate_cached_dirfd (dirfd, pathname);
   return ret;
 }
 
 /* Replacement for unlink() */
-int safe_unlink (const char *pathname)
+int
+safe_unlink (char *pathname)
 {
-  int dirfd;
-
-  if (unsafe)
-    return unlink (pathname);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return unlinkat (dirfd, pathname, 0);
 }
 
 /* Replacement for symlink() */
-int safe_symlink (const char *target, const char *linkpath)
+int
+safe_symlink (char const *target, char *linkpath)
 {
-  int dirfd;
-
-  if (unsafe)
-    return symlink (target, linkpath);
-
-  dirfd = traverse_path (&linkpath);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&linkpath, true);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return symlinkat (target, dirfd, linkpath);
 }
 
 /* Replacement for chmod() */
-int safe_chmod (const char *pathname, mode_t mode)
+int
+safe_chmod (char *pathname, mode_t mode)
 {
-  int dirfd;
-
-  if (unsafe)
-    return chmod (pathname, mode);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return fchmodat (dirfd, pathname, mode, 0);
 }
 
 /* Replacement for lchown() */
-int safe_lchown (const char *pathname, uid_t owner, gid_t group)
+int
+safe_lchown (char *pathname, uid_t owner, gid_t group)
 {
-  int dirfd;
-
-  if (unsafe)
-    return lchown (pathname, owner, group);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return fchownat (dirfd, pathname, owner, group, AT_SYMLINK_NOFOLLOW);
 }
 
 /* Replacement for lutimens() */
-int safe_lutimens (const char *pathname, struct timespec const times[2])
+int
+safe_lutimens (char *pathname, struct timespec const times[2])
 {
-  int dirfd;
-
-  if (unsafe)
-    return utimensat (AT_FDCWD, pathname, times, AT_SYMLINK_NOFOLLOW);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return utimensat (dirfd, pathname, times, AT_SYMLINK_NOFOLLOW);
 }
 
 /* Replacement for readlink() */
-ssize_t safe_readlink (const char *pathname, char *buf, size_t bufsiz)
+ssize_t
+safe_readlink (char *pathname, char *buf, size_t bufsiz)
 {
-  int dirfd;
-
-  if (unsafe)
-    return readlink (pathname, buf, bufsiz);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
   return readlinkat (dirfd, pathname, buf, bufsiz);
 }
 
 /* Replacement for access() */
-int safe_access (const char *pathname, int mode)
+int
+safe_access (char *pathname, int mode)
 {
-  int dirfd;
-
-  if (unsafe)
-    return access (pathname, mode);
-
-  dirfd = traverse_path (&pathname);
-  if (dirfd < 0 && dirfd != AT_FDCWD)
-    return dirfd;
-  return faccessat (dirfd, pathname, mode, 0);
+  int dirfd = traverse_path (&pathname, false);
+  if (dirfd == DIRFD_INVALID)
+    return -1;
+  return faccessat (dirfd, pathname, mode, AT_EACCESS);
 }

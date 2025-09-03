@@ -1,9 +1,9 @@
 /* Define 2-FD at-style functions like linkat or renameat.
-   Copyright (C) 2006, 2009-2018 Free Software Foundation, Inc.
+   Copyright (C) 2006, 2009-2025 Free Software Foundation, Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -25,7 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "dosname.h" /* solely for definition of IS_ABSOLUTE_FILE_NAME */
+#include "filename.h" /* solely for definition of IS_ABSOLUTE_FILE_NAME */
 #include "filenamecat.h"
 #include "openat.h"
 #include "same-inode.h"
@@ -132,7 +132,7 @@ at_func2 (int fd1, char const *file1,
           errno = ENOTDIR;
           return -1;
         }
-      if (SAME_INODE (st1, st2)) /* Reduced to cases 1, 5.  */
+      if (psame_inode (&st1, &st2)) /* Reduced to cases 1, 5.  */
         return func (file1, file2);
     }
   else if (fd2 == AT_FDCWD) /* Cases 12, 13.  */
@@ -144,7 +144,7 @@ at_func2 (int fd1, char const *file1,
           errno = ENOTDIR;
           return -1;
         }
-      if (SAME_INODE (st1, st2)) /* Reduced to cases 4, 5.  */
+      if (psame_inode (&st1, &st2)) /* Reduced to cases 4, 5.  */
         return func (file1, file2);
     }
   else if (fd1 != fd2) /* Case 15b.  */
@@ -156,10 +156,10 @@ at_func2 (int fd1, char const *file1,
           errno = ENOTDIR;
           return -1;
         }
-      if (SAME_INODE (st1, st2)) /* Reduced to case 15a.  */
+      if (psame_inode (&st1, &st2)) /* Reduced to case 15a.  */
         {
           fd2 = fd1;
-          if (stat (".", &st1) == 0 && SAME_INODE (st1, st2))
+          if (stat (".", &st1) == 0 && psame_inode (&st1, &st2))
             return func (file1, file2); /* Further reduced to case 5.  */
         }
     }
@@ -172,8 +172,15 @@ at_func2 (int fd1, char const *file1,
           errno = ENOTDIR;
           return -1;
         }
-      if (stat (".", &st2) == 0 && SAME_INODE (st1, st2))
+      if (stat (".", &st2) == 0 && psame_inode (&st1, &st2))
         return func (file1, file2); /* Reduced to case 5.  */
+    }
+
+  /* Catch invalid arguments before changing directories.  */
+  if (file1[0] == '\0' || file2[0] == '\0')
+    {
+      errno = ENOENT;
+      return -1;
     }
 
   /* Cases 3, 7, 12, 13, 15a, 15b remain.  With all reductions in

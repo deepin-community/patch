@@ -1,9 +1,7 @@
 /* patch - a program to apply diffs to original files */
 
-/* Copyright (C) 1984, 1985, 1986, 1987, 1988 Larry Wall
-
-   Copyright (C) 1989-1993, 1997-1999, 2002-2003, 2006, 2009-2012 Free Software
-   Foundation, Inc.
+/* Copyright 1989-2025 Free Software Foundation, Inc.
+   Copyright 1984-1988 Larry Wall
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -18,11 +16,9 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
 
-#define XTERN
 #include <common.h>
-#undef XTERN
-#define XTERN extern
 #include <argmatch.h>
+#include <closeout.h>
 #include <exitfail.h>
 #include <getopt.h>
 #include <inp.h>
@@ -31,40 +27,87 @@
 #include <util.h>
 #include <version.h>
 #include <xalloc.h>
-#include <gl_linked_list.h>
-#include <gl_xlist.h>
-#include <minmax.h>
+#include <xstdopen.h>
 #include <safe.h>
+
+#ifndef __has_feature
+# define __has_feature(a) false
+#endif
+
+#if defined __SANITIZE_ADDRESS__ || __has_feature (address_sanitizer)
+# define SANITIZE_ADDRESS true
+#else
+# define SANITIZE_ADDRESS false
+#endif
+
+/* See common.h for the declarations of these variables.  */
+
+bool batch;
+bool canonicalize_ws;
+bool dry_run;
+bool follow_symlinks;
+bool force;
+bool no_strip_trailing_cr;
+bool noreverse_flag;
+bool posixly_correct;
+bool reverse_flag;
+bool set_time;
+bool set_utc;
+bool skip_rest_of_patch;
+char *inname;
+char *outfile;
+char *revision;
+char const *origbase;
+char const *origprae;
+char const *origsuff;
+enum conflict_style conflict_style;
+enum diff diff_type;
+enum verbosity verbosity;
+idx_t last_frozen_line;
+#ifndef binary_transput
+int binary_transput;
+#endif
+int inerrno;
+intmax_t patch_get;
+intmax_t strippath;
+ptrdiff_t in_offset;
+ptrdiff_t out_offset;
+signed char invc;
+struct stat instat;
+struct outfile tmped = { .temporary = true };
+struct outfile tmppat = { .temporary = true };
+#ifndef debug
+unsigned short int debug;
+#endif
 
 /* procedures */
 
-static FILE *create_output_file (char const *, int);
-static lin locate_hunk (lin);
-static bool check_line_endings (lin);
-static bool apply_hunk (struct outstate *, lin);
-static bool patch_match (lin, lin, lin, lin);
+static FILE *create_output_file (struct outfile *, int);
+static idx_t locate_hunk (idx_t);
+static bool check_line_endings (idx_t);
+static bool apply_hunk (struct outstate *, idx_t);
+static bool patch_match (idx_t, idx_t, idx_t, idx_t);
 static bool spew_output (struct outstate *, struct stat *);
-static int numeric_string (char const *, bool, char const *);
-static void cleanup (void);
-static void get_some_switches (void);
+static intmax_t numeric_string (char const *, bool, char const *);
+static void perfile_cleanup_remove (void);
+static void cleanup_remove (void);
+static void perfile_cleanup_free (void);
+static void get_some_switches (int, char **);
 static void init_output (struct outstate *);
-static FILE *open_outfile (char const *);
+static FILE *open_outfile (char *);
 static void init_reject (char const *);
 static void reinitialize_almost_everything (void);
-static void remove_if_needed (char const *, bool *);
-static void usage (FILE *, int) __attribute__((noreturn));
+_Noreturn static void usage (FILE *, int);
 
 static void abort_hunk (char const *, bool, bool);
 static void abort_hunk_context (bool, bool);
 static void abort_hunk_unified (bool, bool);
 
-static void output_file (char const *, bool *, const struct stat *, char const *,
+static void output_file (struct outfile *, const struct stat *, char *,
 			 const struct stat *, mode_t, bool);
 
-static void init_files_to_delete (void);
-static void init_files_to_output (void);
 static void delete_files (void);
-static void output_files (struct stat const *);
+static void output_files (struct stat const *, int);
 
 #ifdef ENABLE_MERGE
 static bool merge;
@@ -75,6 +118,7 @@ static bool merge;
 static enum diff reject_format = NO_DIFF;  /* automatic */
 static bool make_backups;
 static bool backup_if_mismatch;
+static bool backup_if_mismatch_specified;
 static char const *version_control;
 static char const *version_control_context;
 static bool remove_empty_files;
@@ -85,22 +129,19 @@ static enum { RO_IGNORE, RO_WARN, RO_FAIL } read_only_behavior = RO_WARN;
 static bool reverse_flag_specified;
 
 static char const *do_defines; /* symbol to patch using ifdef, ifndef, etc. */
-static char const if_defined[] = "\n#ifdef %s\n";
-static char const not_defined[] = "\n#ifndef %s\n";
+static char const if_defined[] = "\n#ifdef ";
+static char const not_defined[] = "\n#ifndef ";
 static char const else_defined[] = "\n#else\n";
 static char const end_defined[] = "\n#endif\n";
-
-static int Argc;
-static char **Argv;
 
 static FILE *rejfp;  /* reject file pointer */
 
 static char const *patchname;
-static char *rejname;
-static char const * TMPREJNAME;
-static bool TMPREJNAME_needs_removal;
+static struct outfile outrej;
+static struct outfile tmpout = { .temporary = true };
+static struct outfile tmprej = { .temporary = true };
 
-static lin maxfuzz = 2;
+static intmax_t maxfuzz = 2;
 
 static char serrbuf[BUFSIZ];
 
@@ -113,34 +154,28 @@ main (int argc, char **argv)
     bool somefailed = false;
     struct outstate outstate;
     struct stat tmpoutst;
-    char numbuf[LINENUM_LENGTH_BOUND + 1];
-    bool written_to_rejname = false;
     bool skip_reject_file = false;
     bool apply_empty_patch = false;
     mode_t file_type;
-    int outfd = -1;
     bool have_git_diff = false;
 
-    exit_failure = 2;
+    exit_failure = EXIT_TROUBLE;
     set_program_name (argv[0]);
     init_time ();
 
+    xstdopen ();
     setbuf(stderr, serrbuf);
-
-    bufsize = 8 * 1024;
-    buf = xmalloc (bufsize);
+    atexit (close_stdout);
 
     strippath = -1;
 
     val = getenv ("QUOTING_STYLE");
     {
       int i = val ? argmatch (val, quoting_style_args, 0, 0) : -1;
-      set_quoting_style ((struct quoting_options *) 0,
-			 i < 0 ? shell_quoting_style : (enum quoting_style) i);
+      set_quoting_style (nullptr, i < 0 ? shell_quoting_style : i);
     }
 
     posixly_correct = getenv ("POSIXLY_CORRECT") != 0;
-    backup_if_mismatch = ! posixly_correct;
     patch_get = ((val = getenv ("PATCH_GET"))
 		 ? numeric_string (val, true, "PATCH_GET value")
 		 : 0);
@@ -154,18 +189,16 @@ main (int argc, char **argv)
       version_control_context = "$VERSION_CONTROL";
 
     init_backup_hash_table ();
-    init_files_to_delete ();
-    init_files_to_output ();
 
     /* parse switches */
-    Argc = argc;
-    Argv = argv;
-    get_some_switches();
+    get_some_switches (argc, argv);
 
     /* Make get_date() assume that context diff headers use UTC. */
-    if (set_utc)
-      setenv ("TZ", "UTC", 1);
+    if (set_utc && setenv ("TZ", "UTC0", 1) < 0)
+      pfatal ("setenv");
 
+    if (!backup_if_mismatch_specified)
+      backup_if_mismatch = !posixly_correct;
     if (make_backups | backup_if_mismatch)
       backup_type = get_version (version_control_context, version_control);
 
@@ -174,7 +207,7 @@ main (int argc, char **argv)
       outstate.ofp = open_outfile (outfile);
 
     /* Make sure we clean up in case of disaster.  */
-    set_signals (false);
+    init_signals ();
 
     /* When the file to patch is specified on the command line, allow that file
        to lie outside the current working tree.  Still doesn't allow to follow
@@ -200,10 +233,10 @@ main (int argc, char **argv)
 	  skip_reject_file = false,
 	  apply_empty_patch = false
     ) {					/* for each patch in patch file */
-      int hunk = 0;
-      int failed = 0;
+      intmax_t hunk = 0;
+      intmax_t failed = 0;
       bool mismatch = false;
-      char const *outname = NULL;
+      char *outname = nullptr;
 
       if (skip_rest_of_patch)
 	somefailed = true;
@@ -212,37 +245,29 @@ main (int argc, char **argv)
 	{
 	  if (have_git_diff)
 	    {
-	      output_files (NULL);
+	      output_files (nullptr, 0);
 	      inerrno = -1;
 	    }
 	  have_git_diff = ! have_git_diff;
 	}
 
-      if (TMPREJNAME_needs_removal)
+      if (rejfp)
 	{
-	  if (rejfp)
-	    {
-	      fclose (rejfp);
-	      rejfp = NULL;
-	    }
-	  remove_if_needed (TMPREJNAME, &TMPREJNAME_needs_removal);
+	  Fclose (rejfp);
+	  rejfp = nullptr;
 	}
-      if (TMPOUTNAME_needs_removal)
-        {
-	  if (outfd != -1)
-	    {
-	      close (outfd);
-	      outfd = -1;
-	    }
-	  remove_if_needed (TMPOUTNAME, &TMPOUTNAME_needs_removal);
-	}
+
+      defer_signals ();
+      perfile_cleanup_remove ();
+      undefer_signals ();
+      perfile_cleanup_free ();
 
       if (! skip_rest_of_patch && ! file_type)
 	{
-	  say ("File %s: can't change file type from 0%o to 0%o.\n",
-	       quotearg (inname),
-	       (unsigned int) (pch_mode (reverse) & S_IFMT),
-	       (unsigned int) (pch_mode (! reverse) & S_IFMT));
+	  unsigned int old_mode = pch_mode (  reverse_flag) & S_IFMT;
+	  unsigned int new_mode = pch_mode (! reverse_flag) & S_IFMT;
+	  say ("File %s: can't change file type from %#o to %#o.\n",
+	       quotearg (inname), old_mode, new_mode);
 	  skip_rest_of_patch = true;
 	  somefailed = true;
 	}
@@ -252,7 +277,7 @@ main (int argc, char **argv)
 	  if (outfile)
 	    outname = outfile;
 	  else if (pch_copy () || pch_rename ())
-	    outname = pch_name (! reverse);
+	    outname = pch_name (! reverse_flag);
 	  else
 	    outname = inname;
 	}
@@ -280,7 +305,7 @@ main (int argc, char **argv)
 	    {
 	      if (has_queued_output (&outstat))
 		{
-		  output_files (&outstat);
+		  output_files (&outstat, 0);
 		  outerrno = stat_file (outname, &outstat);
 		  inerrno = -1;
 		}
@@ -314,38 +339,36 @@ main (int argc, char **argv)
 	}
 
       tmpoutst.st_size = -1;
-      outfd = make_tempfile (&TMPOUTNAME, 'o', outname,
-			     O_WRONLY | binary_transput,
-			     instat.st_mode & S_IRWXUGO);
-      if (outfd == -1)
+      int outfd = make_tempfile (&tmpout, 'o', outname,
+				 O_WRONLY | binary_transput,
+				 instat.st_mode & S_IRWXUGO);
+      if (outfd < 0)
 	{
-	  if (errno == ELOOP || errno == EXDEV)
-	    {
-	      say ("Invalid file name %s -- skipping patch\n", quotearg (outname));
-	      skip_rest_of_patch = true;
-	      skip_reject_file = true;
-	      somefailed = true;
-	    }
-	  else
-	    pfatal ("Can't create temporary file %s", TMPOUTNAME);
+	  /* FIXME: Explain why ELOOP and EXDEV are special here.  */
+	  if (diff_type == ED_DIFF
+	      || ! (errno == ELOOP || errno == EXDEV))
+	    pfatal ("Can't create temporary file %s", tmpout.name);
+
+	  say ("Invalid file name %s -- skipping patch\n", quotearg (outname));
+	  skip_rest_of_patch = true;
+	  skip_reject_file = true;
+	  somefailed = true;
 	}
-      else
-        TMPOUTNAME_needs_removal = true;
+      if (!outfile)
+	init_output (&outstate);
+      int ifd = -1;
+
       if (diff_type == ED_DIFF) {
 	outstate.zero_output = false;
 	somefailed |= skip_rest_of_patch;
-	do_ed_script (inname, TMPOUTNAME, &TMPOUTNAME_needs_removal,
-		      outstate.ofp);
+	do_ed_script (inname, &tmpout, outstate.ofp);
 	if (! dry_run && ! outfile && ! skip_rest_of_patch)
 	  {
 	    if (fstat (outfd, &tmpoutst) != 0)
-	      pfatal ("%s", TMPOUTNAME);
+	      pfatal ("%s", tmpout.name);
 	    outstate.zero_output = tmpoutst.st_size == 0;
 	  }
-	close (outfd);
-	outfd = -1;
       } else {
-	int got_hunk;
 	bool apply_anyway = merge;  /* don't try to reverse when merging */
 
 	if (! skip_rest_of_patch && diff_type == GIT_BINARY_DIFF) {
@@ -357,17 +380,31 @@ main (int argc, char **argv)
 	/* initialize the patched file */
 	if (! skip_rest_of_patch && ! outfile)
 	  {
-	    init_output (&outstate);
-	    outstate.ofp = fdopen(outfd, binary_transput ? "wb" : "w");
+	    outstate.ofp = fdopen (outfd, binary_transput ? "wb" : "w");
 	    if (! outstate.ofp)
-	      pfatal ("%s", TMPOUTNAME);
+	      pfatal ("%s", tmpout.name);
 	    /* outstate.ofp now owns the file descriptor */
-	    outfd = -1;
+	  }
+	else
+	  {
+	    /* When writing to a single output file (-o FILE), always pretend
+	       that the output file ends in a newline.  Otherwise, when another
+	       file is written to the same output file, apply_hunk will fail.  */
+	    outstate.after_newline = true;
 	  }
 
 	/* find out where all the lines are */
 	if (!skip_rest_of_patch) {
-	    scan_input (inname, file_type);
+	    if (S_ISREG (file_type) && instat.st_size != 0)
+	      {
+		int oflags = (O_RDONLY | binary_transput
+			      | (follow_symlinks ? 0 : O_NOFOLLOW));
+		ifd = safe_open (inname, oflags, 0);
+		if (ifd < 0)
+		  pfatal ("Can't open file %s", quotearg (inname));
+	      }
+
+	    scan_input (inname, file_type, ifd);
 
 	    if (verbosity != SILENT)
 	      {
@@ -384,21 +421,16 @@ main (int argc, char **argv)
 		       pch_copy () ? "copied" :
 		       (pch_rename () ? "renamed" : "read"),
 		       ! skip_rename ? inname : pch_name (! strcmp (inname, pch_name (OLD))));
-		if (verbosity == VERBOSE)
-		  say ("Using Plan %s...\n", using_plan_a ? "A" : "B");
 	      }
 	}
 
-	/* from here on, open no standard i/o files, because malloc */
-	/* might misfire and we can't catch it easily */
-
 	/* apply each hunk of patch */
-	while (0 < (got_hunk = another_hunk (diff_type, reverse)))
+	while (another_hunk (diff_type, reverse_flag))
 	  {
-	    lin where = 0; /* Pacify 'gcc -Wall'.  */
-	    lin newwhere;
-	    lin fuzz = 0;
-	    lin mymaxfuzz;
+	    idx_t where = 0; /* Pacify 'gcc -Wall'.  */
+	    idx_t newwhere;
+	    idx_t fuzz = 0;
+	    idx_t mymaxfuzz;
 
 	    if (merge)
 	      {
@@ -407,60 +439,47 @@ main (int argc, char **argv)
 	      }
 	    else
 	      {
-		lin prefix_context = pch_prefix_context ();
-		lin suffix_context = pch_suffix_context ();
-		lin context = (prefix_context < suffix_context
-			       ? suffix_context : prefix_context);
-		mymaxfuzz = (maxfuzz < context ? maxfuzz : context);
+		idx_t prefix_context = pch_prefix_context ();
+		idx_t suffix_context = pch_suffix_context ();
+		idx_t context = MAX (prefix_context, suffix_context);
+		mymaxfuzz = MIN (maxfuzz, context);
 	      }
 
 	    hunk++;
 	    if (!skip_rest_of_patch) {
+		bool incr_fuzz;
 		do {
+		    incr_fuzz = true;
 		    where = locate_hunk(fuzz);
 		    if (! where || fuzz || in_offset)
 		      mismatch = true;
 		    if (hunk == 1 && ! where && ! (force | apply_anyway)
-			&& reverse == reverse_flag_specified) {
+			&& reverse_flag == reverse_flag_specified) {
 						/* dwim for reversed patch? */
-			if (!pch_swap()) {
-			    say (
-"Not enough memory to try swapped hunk!  Assuming unswapped.\n");
-			    continue;
-			}
+			pch_swap ();
 			/* Try again.  */
 			where = locate_hunk (fuzz);
 			if (where
 			    && (ok_to_reverse
 				("%s patch detected!",
-				 (reverse
+				 (reverse_flag
 				  ? "Unreversed"
 				  : "Reversed (or previously applied)"))))
-			  reverse = ! reverse;
+			  reverse_flag = ! reverse_flag;
 			else
 			  {
 			    /* Put it back to normal.  */
-			    if (! pch_swap ())
-			      fatal ("lost hunk on alloc error!");
+			    pch_swap ();
 			    if (where)
 			      {
 				apply_anyway = true;
-				fuzz--; /* Undo '++fuzz' below.  */
+				incr_fuzz = false;
 				where = 0;
 			      }
 			  }
 		    }
 		} while (!skip_rest_of_patch && !where
-			 && ++fuzz <= mymaxfuzz);
-
-		if (skip_rest_of_patch) {		/* just got decided */
-		  if (outstate.ofp && ! outfile)
-		    {
-		      fclose (outstate.ofp);
-		      outstate.ofp = 0;
-		      outfd = -1;
-		    }
-		}
+			 && (fuzz += incr_fuzz) <= mymaxfuzz);
 	    }
 
 	    newwhere = (where ? where : pch_first()) + out_offset;
@@ -468,19 +487,19 @@ main (int argc, char **argv)
 		|| (merge && ! merge_hunk (hunk, &outstate, where,
 					   &somefailed))
 		|| (! merge
-		    && ((where == 1 && pch_says_nonexistent (reverse) == 2
+		    && ((where == 1 && pch_says_nonexistent (reverse_flag) == 2
 			 && instat.st_size)
 			|| ! where
 			|| ! apply_hunk (&outstate, where))))
 	      {
 		if (! skip_reject_file)
-		  abort_hunk (outname, ! failed, reverse);
+		  abort_hunk (outname, ! failed, reverse_flag);
 		failed++;
 		if (verbosity == VERBOSE ||
 		    (! skip_rest_of_patch && verbosity != SILENT))
-		  say ("Hunk #%d %s at %s%s.\n", hunk,
+		  say ("Hunk #%jd %s at %td%s.\n", hunk,
 		       skip_rest_of_patch ? "ignored" : "FAILED",
-		       format_linenum (numbuf, newwhere),
+		       newwhere,
 		       ! skip_rest_of_patch && check_line_endings (newwhere)
 			 ?  " (different line endings)" : "");
 	      }
@@ -488,33 +507,18 @@ main (int argc, char **argv)
 		     (verbosity == VERBOSE
 		      || (verbosity != SILENT && (fuzz || in_offset))))
 	      {
-		say ("Hunk #%d succeeded at %s", hunk,
-		     format_linenum (numbuf, newwhere));
+		say ("Hunk #%jd succeeded at %td", hunk, newwhere);
 		if (fuzz)
-		  say (" with fuzz %s", format_linenum (numbuf, fuzz));
+		  say (" with fuzz %td", fuzz);
 		if (in_offset)
-		  say (" (offset %s line%s)",
-		       format_linenum (numbuf, in_offset),
-		       "s" + (in_offset == 1));
+		  say (" (offset %td line%s)", in_offset,
+		       &"s"[in_offset == 1]);
 		say (".\n");
 	      }
 	  }
 
 	if (!skip_rest_of_patch)
 	  {
-	    if (got_hunk < 0  &&  using_plan_a)
-	      {
-		if (outfile)
-		  fatal ("out of memory using Plan A");
-		say ("\n\nRan out of memory using Plan A -- trying again...\n\n");
-		if (outstate.ofp)
-		  {
-		    fclose (outstate.ofp);
-		    outstate.ofp = 0;
-		  }
-		continue;
-	      }
-
 	    /* Finish spewing out the new file.  */
 	    if (! spew_output (&outstate, &tmpoutst))
 	      {
@@ -525,25 +529,25 @@ main (int argc, char **argv)
       }
 
       /* and put the output where desired */
-      ignore_signals ();
+      bool replace_file = false, backup;
+      mode_t mode;
       if (! skip_rest_of_patch && ! outfile) {
-	  bool backup = make_backups
-			|| (backup_if_mismatch && (mismatch | failed));
+	  backup = make_backups || (backup_if_mismatch && (mismatch | failed));
 	  if (outstate.zero_output
 	      && (remove_empty_files
-		  || (pch_says_nonexistent (! reverse) == 2
+		  || (pch_says_nonexistent (! reverse_flag) == 2
 		      && ! posixly_correct)
 		  || S_ISLNK (file_type)))
 	    {
 	      if (! dry_run)
-		output_file (NULL, NULL, NULL, outname,
-			     (inname == outname) ? &instat : NULL,
+		output_file (nullptr, nullptr, outname,
+			     (inname == outname) ? &instat : nullptr,
 			     file_type | 0, backup);
 	    }
 	  else
 	    {
 	      if (! outstate.zero_output
-		  && pch_says_nonexistent (! reverse) == 2
+		  && pch_says_nonexistent (! reverse_flag) == 2
 		  && (remove_empty_files || ! posixly_correct)
 		  && ! (merge && somefailed))
 		{
@@ -556,8 +560,8 @@ main (int argc, char **argv)
 
 	      if (! dry_run)
 		{
-		  mode_t old_mode = pch_mode (reverse);
-		  mode_t new_mode = pch_mode (! reverse);
+		  mode_t old_mode = pch_mode (reverse_flag);
+		  mode_t new_mode = pch_mode (! reverse_flag);
 		  bool set_mode = new_mode && old_mode != new_mode;
 
 		  /* Avoid replacing files when nothing has changed.  */
@@ -565,17 +569,17 @@ main (int argc, char **argv)
 		      || pch_copy () || pch_rename ())
 		    {
 		      enum file_attributes attr = 0;
-		      struct timespec new_time = pch_timestamp (! reverse);
-		      mode_t mode = file_type |
+		      struct timespec new_time = p_timestamp[! reverse_flag];
+		      mode = file_type |
 			  ((set_mode ? new_mode : instat.st_mode) & S_IRWXUGO);
 
-		      if ((set_time | set_utc) && new_time.tv_sec != -1)
+		      if ((set_time | set_utc) && 0 <= new_time.tv_nsec)
 			{
-			  struct timespec old_time = pch_timestamp (reverse);
+			  struct timespec old_time = p_timestamp[reverse_flag];
 
 			  if (! force && ! inerrno
-			      && pch_says_nonexistent (reverse) != 2
-			      && old_time.tv_sec != -1
+			      && pch_says_nonexistent (reverse_flag) != 2
+			      && 0 <= old_time.tv_nsec
 			      && timespec_cmp (old_time,
 					       get_stat_mtime (&instat)))
 			    say ("Not setting time of file %s "
@@ -593,48 +597,77 @@ main (int argc, char **argv)
 		        {
 			  if (set_mode)
 			    attr |= FA_MODE;
-			  set_file_attributes (TMPOUTNAME, attr, NULL, NULL,
+			  set_file_attributes (tmpout.name, outfd, attr,
+					       nullptr, -1, nullptr,
 					       mode, &new_time);
 			}
 		      else
 			{
 			  attr |= FA_IDS | FA_MODE | FA_XATTRS;
-			  set_file_attributes (TMPOUTNAME, attr, inname, &instat,
-					       mode, &new_time);
+			  set_file_attributes (tmpout.name, outfd, attr,
+					       inname, ifd,
+					       &instat, mode, &new_time);
 			}
 
-		      output_file (TMPOUTNAME, &TMPOUTNAME_needs_removal,
-				   &tmpoutst, outname, NULL, mode, backup);
-
-		      if (pch_rename ())
-			output_file (NULL, NULL, NULL, inname, &instat,
-				     mode, backup);
+		      replace_file = true;
 		    }
-		  else
-		    output_file (outname, NULL, &tmpoutst, NULL, NULL,
-				 file_type | 0, backup);
+		  else if (backup)
+		    {
+		      struct stat outstat;
+
+		      if (stat_file (outname, &outstat) != 0)
+			say ("Cannot stat file %s, skipping backup\n", outname);
+		      else
+			output_file (&(struct outfile) { .name = outname },
+				     &outstat, nullptr, nullptr,
+				     file_type | 0, true);
+		    }
 		}
 	    }
       }
+
+      if (0 <= ifd && close (ifd) < 0)
+	read_fatal ();
+
+      if (!outfile)
+	{
+	  if (outstate.ofp)
+	    {
+	      Fclose (outstate.ofp);
+	      outstate.ofp = nullptr;
+	    }
+	  else if (0 <= outfd && close (outfd) < 0)
+	    write_fatal ();
+	}
+
+      if (replace_file)
+	{
+	  output_file (&tmpout, &tmpoutst, outname, nullptr, mode, backup);
+	  if (pch_rename ())
+	    output_file (nullptr, nullptr, inname, &instat, mode, backup);
+	}
+
       if (diff_type != ED_DIFF) {
 	struct stat rejst;
 
 	if (failed && ! skip_reject_file) {
-	    if (fstat (fileno (rejfp), &rejst) != 0 || fclose (rejfp) != 0)
+	    Fflush (rejfp);
+	    if (fstat (fileno (rejfp), &rejst) < 0)
 	      write_fatal ();
-	    rejfp = NULL;
+	    Fclose (rejfp);
+	    rejfp = nullptr;
 	    somefailed = true;
-	    say ("%d out of %d hunk%s %s", failed, hunk, "s" + (hunk == 1),
+	    say ("%jd out of %jd hunk%s %s", failed, hunk, &"s"[hunk == 1],
 		 skip_rest_of_patch ? "ignored" : "FAILED");
+	    char *rejname = outrej.name;
 	    if (outname && (! rejname || strcmp (rejname, "-") != 0)) {
 		char *rej = rejname;
 		if (!rejname) {
 		    /* FIXME: This should really be done differently!  */
 		    const char *s = simple_backup_suffix;
-		    size_t len;
 		    simple_backup_suffix = ".rej";
-		    rej = find_backup_file_name (outname, simple_backups);
-		    len = strlen (rej);
+		    rej = find_backup_file_name (AT_FDCWD, outname, simple_backups);
+		    idx_t len = strlen (rej);
 		    if (rej[len - 1] == '~')
 		      rej[len - 1] = '#';
 		    simple_backup_suffix = s;
@@ -644,14 +677,11 @@ main (int argc, char **argv)
 		    say (" -- saving rejects to file %s\n", quotearg (rej));
 		    if (rejname)
 		      {
-			if (! written_to_rejname)
-			  {
-			    copy_file (TMPREJNAME, rejname, 0, 0,
-				       S_IFREG | 0666, true);
-			    written_to_rejname = true;
-			  }
+			if (!outrej.exists)
+			  copy_file (tmprej.name, nullptr, &outrej, nullptr, 0,
+				     S_IFREG | 0666, 0, true);
 			else
-			  append_to_file (TMPREJNAME, rejname);
+			  append_to_file (tmprej.name, rejname);
 		      }
 		    else
 		      {
@@ -662,9 +692,9 @@ main (int argc, char **argv)
 			if (olderrno && olderrno != ENOENT)
 			  write_fatal ();
 		        if (! olderrno && lookup_file_id (&oldst) == CREATED)
-			  append_to_file (TMPREJNAME, rej);
+			  append_to_file (tmprej.name, rej);
 			else
-			  move_file (TMPREJNAME, &TMPREJNAME_needs_removal,
+			  move_file (&tmprej,
 				     &rejst, rej, S_IFREG | 0666, false);
 		      }
 		  }
@@ -676,16 +706,17 @@ main (int argc, char **argv)
 	      say ("\n");
 	}
       }
-      set_signals (true);
     }
-    if (outstate.ofp && (ferror (outstate.ofp) || fclose (outstate.ofp) != 0))
-      write_fatal ();
-    output_files (NULL);
-    cleanup ();
+    if (outstate.ofp)
+      Fclose (outstate.ofp);
+
+    defer_signals ();
+    cleanup_remove ();
+    undefer_signals ();
+
+    output_files (nullptr, 1);
     delete_files ();
-    if (somefailed)
-      exit (1);
-    return 0;
+    return somefailed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 /* Prepare to find the next patch to do in the patch file. */
@@ -714,7 +745,7 @@ reinitialize_almost_everything (void)
 	revision = 0;
     }
 
-    reverse = reverse_flag_specified;
+    reverse_flag = reverse_flag_specified;
     skip_rest_of_patch = false;
 }
 
@@ -726,50 +757,50 @@ static char const shortopts[] = "bB:cd:D:eEfF:g:i:l"
 
 static struct option const longopts[] =
 {
-  {"backup", no_argument, NULL, 'b'},
-  {"prefix", required_argument, NULL, 'B'},
-  {"context", no_argument, NULL, 'c'},
-  {"directory", required_argument, NULL, 'd'},
-  {"ifdef", required_argument, NULL, 'D'},
-  {"ed", no_argument, NULL, 'e'},
-  {"remove-empty-files", no_argument, NULL, 'E'},
-  {"force", no_argument, NULL, 'f'},
-  {"fuzz", required_argument, NULL, 'F'},
-  {"get", required_argument, NULL, 'g'},
-  {"input", required_argument, NULL, 'i'},
-  {"ignore-whitespace", no_argument, NULL, 'l'},
+  {"backup", no_argument, nullptr, 'b'},
+  {"prefix", required_argument, nullptr, 'B'},
+  {"context", no_argument, nullptr, 'c'},
+  {"directory", required_argument, nullptr, 'd'},
+  {"ifdef", required_argument, nullptr, 'D'},
+  {"ed", no_argument, nullptr, 'e'},
+  {"remove-empty-files", no_argument, nullptr, 'E'},
+  {"force", no_argument, nullptr, 'f'},
+  {"fuzz", required_argument, nullptr, 'F'},
+  {"get", required_argument, nullptr, 'g'},
+  {"input", required_argument, nullptr, 'i'},
+  {"ignore-whitespace", no_argument, nullptr, 'l'},
 #ifdef ENABLE_MERGE
-  {"merge", optional_argument, NULL, 'm'},
+  {"merge", optional_argument, nullptr, 'm'},
 #endif
-  {"normal", no_argument, NULL, 'n'},
-  {"forward", no_argument, NULL, 'N'},
-  {"output", required_argument, NULL, 'o'},
-  {"strip", required_argument, NULL, 'p'},
-  {"reject-file", required_argument, NULL, 'r'},
-  {"reverse", no_argument, NULL, 'R'},
-  {"quiet", no_argument, NULL, 's'},
-  {"silent", no_argument, NULL, 's'},
-  {"batch", no_argument, NULL, 't'},
-  {"set-time", no_argument, NULL, 'T'},
-  {"unified", no_argument, NULL, 'u'},
-  {"version", no_argument, NULL, 'v'},
-  {"version-control", required_argument, NULL, 'V'},
-  {"debug", required_argument, NULL, 'x'},
-  {"basename-prefix", required_argument, NULL, 'Y'},
-  {"suffix", required_argument, NULL, 'z'},
-  {"set-utc", no_argument, NULL, 'Z'},
-  {"dry-run", no_argument, NULL, CHAR_MAX + 1},
-  {"verbose", no_argument, NULL, CHAR_MAX + 2},
-  {"binary", no_argument, NULL, CHAR_MAX + 3},
-  {"help", no_argument, NULL, CHAR_MAX + 4},
-  {"backup-if-mismatch", no_argument, NULL, CHAR_MAX + 5},
-  {"no-backup-if-mismatch", no_argument, NULL, CHAR_MAX + 6},
-  {"posix", no_argument, NULL, CHAR_MAX + 7},
-  {"quoting-style", required_argument, NULL, CHAR_MAX + 8},
-  {"reject-format", required_argument, NULL, CHAR_MAX + 9},
-  {"read-only", required_argument, NULL, CHAR_MAX + 10},
-  {"follow-symlinks", no_argument, NULL, CHAR_MAX + 11},
-  {NULL, no_argument, NULL, 0}
+  {"normal", no_argument, nullptr, 'n'},
+  {"forward", no_argument, nullptr, 'N'},
+  {"output", required_argument, nullptr, 'o'},
+  {"strip", required_argument, nullptr, 'p'},
+  {"reject-file", required_argument, nullptr, 'r'},
+  {"reverse", no_argument, nullptr, 'R'},
+  {"quiet", no_argument, nullptr, 's'},
+  {"silent", no_argument, nullptr, 's'},
+  {"batch", no_argument, nullptr, 't'},
+  {"set-time", no_argument, nullptr, 'T'},
+  {"unified", no_argument, nullptr, 'u'},
+  {"version", no_argument, nullptr, 'v'},
+  {"version-control", required_argument, nullptr, 'V'},
+  {"debug", required_argument, nullptr, 'x'},
+  {"basename-prefix", required_argument, nullptr, 'Y'},
+  {"suffix", required_argument, nullptr, 'z'},
+  {"set-utc", no_argument, nullptr, 'Z'},
+  {"dry-run", no_argument, nullptr, CHAR_MAX + 1},
+  {"verbose", no_argument, nullptr, CHAR_MAX + 2},
+  {"binary", no_argument, nullptr, CHAR_MAX + 3},
+  {"help", no_argument, nullptr, CHAR_MAX + 4},
+  {"backup-if-mismatch", no_argument, nullptr, CHAR_MAX + 5},
+  {"no-backup-if-mismatch", no_argument, nullptr, CHAR_MAX + 6},
+  {"posix", no_argument, nullptr, CHAR_MAX + 7},
+  {"quoting-style", required_argument, nullptr, CHAR_MAX + 8},
+  {"reject-format", required_argument, nullptr, CHAR_MAX + 9},
+  {"read-only", required_argument, nullptr, CHAR_MAX + 10},
+  {"follow-symlinks", no_argument, nullptr, CHAR_MAX + 11},
+  {nullptr, no_argument, nullptr, 0}
 };
 
 static char const *const option_help[] =
@@ -849,48 +880,51 @@ usage (FILE *stream, int status)
 {
   char const * const *p;
 
-  if (status != 0)
+  if (status != EXIT_SUCCESS)
     {
-      fprintf (stream, "%s: Try '%s --help' for more information.\n",
-	       program_name, Argv[0]);
+      Fprintf (stream, "%s: Try '%s --help' for more information.\n",
+	       program_name, program_name);
     }
   else
     {
-      fprintf (stream, "Usage: %s [OPTION]... [ORIGFILE [PATCHFILE]]\n\n",
-	       Argv[0]);
+      Fprintf (stream, "Usage: %s [OPTION]... [ORIGFILE [PATCHFILE]]\n\n",
+	       program_name);
       for (p = option_help;  *p;  p++)
-	fprintf (stream, "%s\n", *p);
+	Fprintf (stream, "%s\n", *p);
     }
 
   exit (status);
 }
 
+/* Process a backup file name option argument of type OPTION_TYPE.  */
+static char const *
+backup_file_name_option (char const *option_type)
+{
+  if (!*optarg)
+    fatal ("backup %s is empty", option_type);
+  return xstrdup (optarg);
+}
+
 /* Process switches and filenames.  */
 
 static void
-get_some_switches (void)
+get_some_switches (int argc, char **argv)
 {
     int optc;
-
-    free (rejname);
-    rejname = 0;
-    if (optind == Argc)
-	return;
-    while ((optc = getopt_long (Argc, Argv, shortopts, longopts, (int *) 0))
-	   != -1) {
+    while (0 <= (optc = getopt_long (argc, argv, shortopts, longopts, nullptr)))
 	switch (optc) {
 	    case 'b':
 		make_backups = true;
 		 /* Special hack for backward compatibility with CVS 1.9.
 		    If the last 4 args are '-b SUFFIX ORIGFILE PATCHFILE',
 		    treat '-b' as if it were '-b -z'.  */
-		if (Argc - optind == 3
-		    && strcmp (Argv[optind - 1], "-b") == 0
-		    && ! (Argv[optind + 0][0] == '-' && Argv[optind + 0][1])
-		    && ! (Argv[optind + 1][0] == '-' && Argv[optind + 1][1])
-		    && ! (Argv[optind + 2][0] == '-' && Argv[optind + 2][1]))
+		if (argc - optind == 3
+		    && strcmp (argv[optind - 1], "-b") == 0
+		    && ! (argv[optind + 0][0] == '-' && argv[optind + 0][1])
+		    && ! (argv[optind + 1][0] == '-' && argv[optind + 1][1])
+		    && ! (argv[optind + 2][0] == '-' && argv[optind + 2][1]))
 		  {
-		    optarg = Argv[optind++];
+		    optarg = argv[optind++];
 		    if (verbosity != SILENT)
 		      say ("warning: the '-b %s' option is obsolete; use '-b -z %s' instead\n",
 			   optarg, optarg);
@@ -898,9 +932,7 @@ get_some_switches (void)
 		  }
 		break;
 	    case 'B':
-		if (!*optarg)
-		  fatal ("backup prefix is empty");
-		origprae = xstrdup (optarg);
+		origprae = backup_file_name_option ("prefix");
 		break;
 	    case 'c':
 		diff_type = CONTEXT_DIFF;
@@ -943,7 +975,7 @@ get_some_switches (void)
 		    else if (! strcmp (optarg, "diff3"))
 		      conflict_style = MERGE_DIFF3;
 		    else
-		      usage (stderr, 2);
+		      usage (stderr, EXIT_TROUBLE);
 		  }
 		else
 		  conflict_style = MERGE_MERGE;
@@ -953,7 +985,7 @@ get_some_switches (void)
 		diff_type = NORMAL_DIFF;
 		break;
 	    case 'N':
-		noreverse = true;
+		noreverse_flag = true;
 		break;
 	    case 'o':
 		outfile = xstrdup (optarg);
@@ -962,10 +994,11 @@ get_some_switches (void)
 		strippath = numeric_string (optarg, false, "strip count");
 		break;
 	    case 'r':
-		rejname = xstrdup (optarg);
+		outrej.name = xstrdup (optarg);
+		/* No need to set outrej.alloc, as outrej is never freed.  */
 		break;
 	    case 'R':
-		reverse = true;
+		reverse_flag = true;
 		reverse_flag_specified = true;
 		break;
 	    case 's':
@@ -982,7 +1015,7 @@ get_some_switches (void)
 		break;
 	    case 'v':
 		version();
-		exit (0);
+		exit (EXIT_SUCCESS);
 		break;
 	    case 'V':
 		version_control = optarg;
@@ -994,15 +1027,11 @@ get_some_switches (void)
 		break;
 #endif
 	    case 'Y':
-		if (!*optarg)
-		  fatal ("backup basename prefix is empty");
-		origbase = xstrdup (optarg);
+		origbase = backup_file_name_option ("basename prefix");
 		break;
 	    case 'z':
 	    case_z:
-		if (!*optarg)
-		  fatal ("backup suffix is empty");
-		origsuff = xstrdup (optarg);
+		origsuff = backup_file_name_option ("suffix");
 		break;
 	    case 'Z':
 		set_utc = true;
@@ -1020,12 +1049,14 @@ get_some_switches (void)
 #endif
 		break;
 	    case CHAR_MAX + 4:
-		usage (stdout, 0);
+		usage (stdout, EXIT_SUCCESS);
 	    case CHAR_MAX + 5:
 		backup_if_mismatch = true;
+		backup_if_mismatch_specified = true;
 		break;
 	    case CHAR_MAX + 6:
 		backup_if_mismatch = false;
+		backup_if_mismatch_specified = true;
 		break;
 	    case CHAR_MAX + 7:
 		posixly_correct = true;
@@ -1036,10 +1067,9 @@ get_some_switches (void)
 		  if (i < 0)
 		    {
 		      invalid_arg ("quoting style", optarg, i);
-		      usage (stderr, 2);
+		      usage (stderr, EXIT_TROUBLE);
 		    }
-		  set_quoting_style ((struct quoting_options *) 0,
-				     (enum quoting_style) i);
+		  set_quoting_style (nullptr, i);
 		}
 		break;
 	    case CHAR_MAX + 9:
@@ -1048,7 +1078,7 @@ get_some_switches (void)
 		else if (strcmp (optarg, "unified") == 0)
 		  reject_format = UNI_DIFF;
 		else
-		  usage (stderr, 2);
+		  usage (stderr, EXIT_TROUBLE);
 		break;
 	    case CHAR_MAX + 10:
 		if (strcmp (optarg, "ignore") == 0)
@@ -1058,30 +1088,29 @@ get_some_switches (void)
 		else if (strcmp (optarg, "fail") == 0)
 		  read_only_behavior = RO_FAIL;
 		else
-		  usage (stderr, 2);
+		  usage (stderr, EXIT_TROUBLE);
 		break;
 	    case CHAR_MAX + 11:
 		follow_symlinks = true;
 		break;
 	    default:
-		usage (stderr, 2);
+		usage (stderr, EXIT_TROUBLE);
 	}
-    }
 
     /* Process any filename args.  */
-    if (optind < Argc)
+    if (optind < argc)
       {
-	inname = xstrdup (Argv[optind++]);
+	inname = xstrdup (argv[optind++]);
 	explicit_inname = true;
 	invc = -1;
-	if (optind < Argc)
+	if (optind < argc)
 	  {
-	    patchname = xstrdup (Argv[optind++]);
-	    if (optind < Argc)
+	    patchname = xstrdup (argv[optind++]);
+	    if (optind < argc)
 	      {
-		fprintf (stderr, "%s: %s: extra operand\n",
-			 program_name, quotearg (Argv[optind]));
-		usage (stderr, 2);
+		Fprintf (stderr, "%s: %s: extra operand\n",
+			 program_name, quotearg (argv[optind]));
+		usage (stderr, EXIT_TROUBLE);
 	      }
 	  }
       }
@@ -1089,61 +1118,53 @@ get_some_switches (void)
 
 /* Handle STRING (possibly negative if NEGATIVE_ALLOWED is nonzero)
    of type ARGTYPE_MSGID by converting it to an integer,
-   returning the result.  */
-static int
+   returning the result.  If the integer does not fit,
+   return an extreme value.  */
+static intmax_t
 numeric_string (char const *string,
 		bool negative_allowed,
 		char const *argtype_msgid)
 {
-  int value = 0;
+  intmax_t value = 0;
   char const *p = string;
-  int sign = *p == '-' ? -1 : 1;
+  bool negative = *p == '-';
+  bool overflow = false;
 
-  p += *p == '-' || *p == '+';
+  p += negative || *p == '+';
 
   do
     {
-      int v10 = value * 10;
-      int digit = *p - '0';
-      int signed_digit = sign * digit;
-      int next_value = v10 + signed_digit;
-
-      if (9 < (unsigned) digit)
+      if (!c_isdigit (*p))
 	fatal ("%s %s is not a number", argtype_msgid, quotearg (string));
-
-      if (v10 / 10 != value || (next_value < v10) != (signed_digit < 0))
-	fatal ("%s %s is too large", argtype_msgid, quotearg (string));
-
-      value = next_value;
+      overflow |= ckd_mul (&value, value, 10);
+      overflow |= ckd_add (&value, value, negative ? '0' - *p : *p - '0');
     }
   while (*++p);
 
   if (value < 0 && ! negative_allowed)
     fatal ("%s %s is negative", argtype_msgid, quotearg (string));
 
-  return value;
+  return !overflow ? value : negative ? INTMAX_MIN : INTMAX_MAX;
 }
 
 /* Attempt to find the right place to apply this hunk of patch. */
 
-static lin
-locate_hunk (lin fuzz)
+static idx_t
+locate_hunk (idx_t fuzz)
 {
-    lin first_guess = pch_first () + in_offset;
-    lin offset;
-    lin pat_lines = pch_ptrn_lines();
-    lin prefix_context = pch_prefix_context ();
-    lin suffix_context = pch_suffix_context ();
-    lin context = (prefix_context < suffix_context
-		   ? suffix_context : prefix_context);
-    lin prefix_fuzz = fuzz + prefix_context - context;
-    lin suffix_fuzz = fuzz + suffix_context - context;
-    lin max_where = input_lines - (pat_lines - suffix_fuzz) + 1;
-    lin min_where = last_frozen_line + 1;
-    lin max_pos_offset = max_where - first_guess;
-    lin max_neg_offset = first_guess - min_where;
-    lin max_offset = MAX(max_pos_offset, max_neg_offset);
-    lin min_offset;
+    idx_t first_guess = pch_first () + in_offset;
+    idx_t pat_lines = pch_ptrn_lines ();
+    idx_t prefix_context = pch_prefix_context ();
+    idx_t suffix_context = pch_suffix_context ();
+    idx_t context = MAX (prefix_context, suffix_context);
+    ptrdiff_t prefix_fuzz = fuzz + prefix_context - context;
+    ptrdiff_t suffix_fuzz = fuzz + suffix_context - context;
+    idx_t max_where = input_lines - (pat_lines - suffix_fuzz) + 1;
+    idx_t min_where = last_frozen_line + 1;
+    ptrdiff_t max_pos_offset = max_where - first_guess;
+    ptrdiff_t max_neg_offset = first_guess - min_where;
+    ptrdiff_t max_offset = MAX (max_pos_offset, max_neg_offset);
+    ptrdiff_t min_offset;
 
     if (!pat_lines)			/* null range matches always */
 	return first_guess;
@@ -1161,7 +1182,7 @@ locate_hunk (lin fuzz)
 	  if (pat_lines != input_lines || prefix_context < last_frozen_line)
 	    return 0;
 
-	offset = 1 - first_guess;
+	ptrdiff_t offset = 1 - first_guess;
 	if (last_frozen_line <= prefix_context
 	    && offset <= max_pos_offset
 	    && patch_match (first_guess, offset, 0, suffix_fuzz))
@@ -1178,7 +1199,7 @@ locate_hunk (lin fuzz)
     if (suffix_fuzz < 0)
       {
 	/* Can only match end of file.  */
-	offset = first_guess - (input_lines - pat_lines + 1);
+	ptrdiff_t offset = first_guess - (input_lines - pat_lines + 1);
 	if (offset <= max_neg_offset
 	    && patch_match (first_guess, -offset, prefix_fuzz, 0))
 	  {
@@ -1192,24 +1213,20 @@ locate_hunk (lin fuzz)
     min_offset = max_pos_offset < 0 ? first_guess - max_where
 	       : max_neg_offset < 0 ? first_guess - min_where
 	       : 0;
-    for (offset = min_offset;  offset <= max_offset;  offset++) {
-	char numbuf0[LINENUM_LENGTH_BOUND + 1];
-	char numbuf1[LINENUM_LENGTH_BOUND + 1];
+    for (ptrdiff_t offset = min_offset; offset <= max_offset; offset++) {
 	if (offset <= max_pos_offset
 	    && patch_match (first_guess, offset, prefix_fuzz, suffix_fuzz)) {
 	    if (debug & 1)
-	      say ("Offset changing from %s to %s\n",
-		   format_linenum (numbuf0, in_offset),
-		   format_linenum (numbuf1, in_offset + offset));
+	      say ("Offset changing from %td to %td\n",
+		   in_offset, in_offset + offset);
 	    in_offset += offset;
 	    return first_guess+offset;
 	}
 	if (offset <= max_neg_offset
 	    && patch_match (first_guess, -offset, prefix_fuzz, suffix_fuzz)) {
 	    if (debug & 1)
-	      say ("Offset changing from %s to %s\n",
-		   format_linenum (numbuf0, in_offset),
-		   format_linenum (numbuf1, in_offset - offset));
+	      say ("Offset changing from %td to %td\n",
+		   in_offset, in_offset - offset);
 	    in_offset -= offset;
 	    return first_guess-offset;
 	}
@@ -1217,42 +1234,34 @@ locate_hunk (lin fuzz)
     return 0;
 }
 
-static void __attribute__ ((noreturn))
-mangled_patch (lin old, lin new)
+static void
+mangled_patch (idx_t old, idx_t new)
 {
-  char numbuf0[LINENUM_LENGTH_BOUND + 1];
-  char numbuf1[LINENUM_LENGTH_BOUND + 1];
   if (debug & 1)
     say ("oldchar = '%c', newchar = '%c'\n",
         pch_char (old), pch_char (new));
-  fatal ("Out-of-sync patch, lines %s,%s -- mangled text or line numbers, "
-        "maybe?",
-        format_linenum (numbuf0, pch_hunk_beg () + old),
-        format_linenum (numbuf1, pch_hunk_beg () + new));
+  fatal (("Out-of-sync patch, lines %td,%td"
+	  " -- mangled text or line numbers, maybe?"),
+	 pch_hunk_beg () + old, pch_hunk_beg () + new);
 }
 
 /* Output a line number range in unified format.  */
 
 static void
-print_unidiff_range (FILE *fp, lin start, lin count)
+print_unidiff_range (FILE *fp, idx_t start, idx_t count)
 {
-  char numbuf0[LINENUM_LENGTH_BOUND + 1];
-  char numbuf1[LINENUM_LENGTH_BOUND + 1];
-
   switch (count)
     {
     case 0:
-      fprintf (fp, "%s,0", format_linenum (numbuf0, start - 1));
+      Fprintf (fp, "%td,0", start - 1);
       break;
 
     case 1:
-      fprintf (fp, "%s", format_linenum (numbuf0, start));
+      Fprintf (fp, "%td", start);
       break;
 
     default:
-      fprintf (fp, "%s,%s",
-              format_linenum (numbuf0, start),
-              format_linenum (numbuf1, count));
+      Fprintf (fp, "%td,%td", start, count);
       break;
     }
 }
@@ -1262,9 +1271,7 @@ print_header_line (FILE *fp, const char *tag, bool reverse)
 {
   const char *name = pch_name (reverse);
   const char *timestr = pch_timestr (reverse);
-
-  fprintf (fp, "%s %s%s\n", tag, name ? name : "/dev/null",
-	   timestr ? timestr : "");
+  putline (fp, tag, name ? name : "/dev/null", timestr, nullptr);
 }
 
 /* Produce unified reject files */
@@ -1272,25 +1279,25 @@ print_header_line (FILE *fp, const char *tag, bool reverse)
 static void
 abort_hunk_unified (bool header, bool reverse)
 {
-  lin old = 1;
-  lin lastline = pch_ptrn_lines ();
-  lin new = lastline + 1;
+  idx_t old = 1;
+  idx_t lastline = pch_ptrn_lines ();
+  idx_t new = lastline + 1;
   char const *c_function = pch_c_function();
 
   if (header)
     {
       if (pch_name (INDEX))
-	fprintf(rejfp, "Index: %s\n", pch_name (INDEX));
-      print_header_line (rejfp, "---", reverse);
-      print_header_line (rejfp, "+++", ! reverse);
+	putline (rejfp, "Index: ", pch_name (INDEX), nullptr);
+      print_header_line (rejfp, "--- ", reverse);
+      print_header_line (rejfp, "+++ ", ! reverse);
     }
 
   /* Add out_offset to guess the same as the previous successful hunk.  */
-  fprintf (rejfp, "@@ -");
+  Fputs ("@@ -", rejfp);
   print_unidiff_range (rejfp, pch_first () + out_offset, lastline);
-  fprintf (rejfp, " +");
+  Fputs (" +", rejfp);
   print_unidiff_range (rejfp, pch_newfirst () + out_offset, pch_repl_lines ());
-  fprintf (rejfp, " @@%s\n", c_function ? c_function : "");
+  putline (rejfp, " @@", c_function, nullptr);
 
   while (pch_char (new) == '=' || pch_char (new) == '\n')
     new++;
@@ -1302,12 +1309,12 @@ abort_hunk_unified (bool header, bool reverse)
     {
       for (;  pch_char (old) == '-';  old++)
 	{
-	  fputc ('-', rejfp);
+	  Fputc ('-', rejfp);
 	  pch_write_line (old, rejfp);
 	}
       for (;  pch_char (new) == '+';  new++)
 	{
-	  fputc ('+', rejfp);
+	  Fputc ('+', rejfp);
 	  pch_write_line (new, rejfp);
 	}
 
@@ -1317,7 +1324,7 @@ abort_hunk_unified (bool header, bool reverse)
       if (pch_char (new) != pch_char (old))
 	mangled_patch (old, new);
 
-      fputc (' ', rejfp);
+      Fputc (' ', rejfp);
       pch_write_line (old, rejfp);
     }
   if (pch_char (new) != '^')
@@ -1329,17 +1336,14 @@ abort_hunk_unified (bool header, bool reverse)
 static void
 abort_hunk_context (bool header, bool reverse)
 {
-    lin i;
-    lin pat_end = pch_end ();
+    idx_t pat_end = pch_end ();
     /* add in out_offset to guess the same as the previous successful hunk */
-    lin oldfirst = pch_first() + out_offset;
-    lin newfirst = pch_newfirst() + out_offset;
-    lin oldlast = oldfirst + pch_ptrn_lines() - 1;
-    lin newlast = newfirst + pch_repl_lines() - 1;
-    char const *stars =
-      (int) NEW_CONTEXT_DIFF <= (int) diff_type ? " ****" : "";
-    char const *minuses =
-      (int) NEW_CONTEXT_DIFF <= (int) diff_type ? " ----" : " -----";
+    idx_t oldfirst = pch_first () + out_offset;
+    idx_t newfirst = pch_newfirst () + out_offset;
+    idx_t oldlast = oldfirst + pch_ptrn_lines () - 1;
+    idx_t newlast = newfirst + pch_repl_lines () - 1;
+    char const *stars   = diff_type < NEW_CONTEXT_DIFF ? ""       : " ****";
+    char const *minuses = diff_type < NEW_CONTEXT_DIFF ? " -----" : " ----";
     char const *c_function = pch_c_function();
 
     if (diff_type == UNI_DIFF)
@@ -1348,40 +1352,33 @@ abort_hunk_context (bool header, bool reverse)
     if (header)
       {
 	if (pch_name (INDEX))
-	  fprintf(rejfp, "Index: %s\n", pch_name (INDEX));
-	print_header_line (rejfp, "***", reverse);
-	print_header_line (rejfp, "---", ! reverse);
+	  putline (rejfp, "Index: ", pch_name (INDEX), nullptr);
+	print_header_line (rejfp, "*** ", reverse);
+	print_header_line (rejfp, "--- ", ! reverse);
       }
-    fprintf(rejfp, "***************%s\n", c_function ? c_function : "");
-    for (i=0; i<=pat_end; i++) {
-	char numbuf0[LINENUM_LENGTH_BOUND + 1];
-	char numbuf1[LINENUM_LENGTH_BOUND + 1];
+    putline (rejfp, "***************", c_function, nullptr);
+
+    for (idx_t i = 0; i <= pat_end; i++) {
 	switch (pch_char(i)) {
 	case '*':
 	    if (oldlast < oldfirst)
-		fprintf(rejfp, "*** 0%s\n", stars);
+		Fprintf (rejfp, "*** 0%s\n", stars);
 	    else if (oldlast == oldfirst)
-		fprintf (rejfp, "*** %s%s\n",
-			 format_linenum (numbuf0, oldfirst), stars);
+		Fprintf (rejfp, "*** %td%s\n", oldfirst, stars);
 	    else
-		fprintf (rejfp, "*** %s,%s%s\n",
-			 format_linenum (numbuf0, oldfirst),
-			 format_linenum (numbuf1, oldlast), stars);
+		Fprintf (rejfp, "*** %td,%td%s\n", oldfirst, oldlast, stars);
 	    break;
 	case '=':
 	    if (newlast < newfirst)
-		fprintf(rejfp, "--- 0%s\n", minuses);
+		Fprintf (rejfp, "--- 0%s\n", minuses);
 	    else if (newlast == newfirst)
-		fprintf (rejfp, "--- %s%s\n",
-			 format_linenum (numbuf0, newfirst), minuses);
+		Fprintf (rejfp, "--- %td%s\n", newfirst, minuses);
 	    else
-		fprintf (rejfp, "--- %s,%s%s\n",
-			 format_linenum (numbuf0, newfirst),
-			 format_linenum (numbuf1, newlast), minuses);
+		Fprintf (rejfp, "--- %td,%td%s\n", newfirst, newlast, minuses);
 	    break;
 	case ' ': case '-': case '+': case '!':
-	    fprintf (rejfp, "%c ", pch_char (i));
-	    /* fall into */
+	    Fprintf (rejfp, "%c ", pch_char (i));
+	    FALLTHROUGH;
 	case '\n':
 	    pch_write_line (i, rejfp);
 	    break;
@@ -1398,7 +1395,7 @@ abort_hunk_context (bool header, bool reverse)
 static void
 abort_hunk (char const *outname, bool header, bool reverse)
 {
-  if (! TMPREJNAME_needs_removal)
+  if (!tmprej.exists)
     init_reject (outname);
   if (reject_format == UNI_DIFF
       || (reject_format == NO_DIFF && diff_type == UNI_DIFF))
@@ -1410,14 +1407,14 @@ abort_hunk (char const *outname, bool header, bool reverse)
 /* We found where to apply it (we hope), so do it. */
 
 static bool
-apply_hunk (struct outstate *outstate, lin where)
+apply_hunk (struct outstate *outstate, idx_t where)
 {
-    lin old = 1;
-    lin lastline = pch_ptrn_lines ();
-    lin new = lastline+1;
+    idx_t old = 1;
+    idx_t lastline = pch_ptrn_lines ();
+    idx_t new = lastline + 1;
     enum {OUTSIDE, IN_IFNDEF, IN_IFDEF, IN_ELSE} def_state = OUTSIDE;
     char const *R_do_defines = do_defines;
-    lin pat_end = pch_end ();
+    idx_t pat_end = pch_end ();
     FILE *fp = outstate->ofp;
 
     where--;
@@ -1431,12 +1428,12 @@ apply_hunk (struct outstate *outstate, lin where)
 		return false;
 	    if (R_do_defines) {
 		if (def_state == OUTSIDE) {
-		    fprintf (fp, outstate->after_newline + not_defined,
-			     R_do_defines);
+		    putline (fp, outstate->after_newline + not_defined,
+			     R_do_defines, nullptr);
 		    def_state = IN_IFNDEF;
 		}
 		else if (def_state == IN_IFDEF) {
-		    fputs (outstate->after_newline + else_defined, fp);
+		    Fputs (outstate->after_newline + else_defined, fp);
 		    def_state = IN_ELSE;
 		}
 		if (ferror (fp))
@@ -1455,12 +1452,12 @@ apply_hunk (struct outstate *outstate, lin where)
 		return false;
 	    if (R_do_defines) {
 		if (def_state == IN_IFNDEF) {
-		    fputs (outstate->after_newline + else_defined, fp);
+		    Fputs (outstate->after_newline + else_defined, fp);
 		    def_state = IN_ELSE;
 		}
 		else if (def_state == OUTSIDE) {
-		    fprintf (fp, outstate->after_newline + if_defined,
-			     R_do_defines);
+		    putline (fp, outstate->after_newline + if_defined,
+			     R_do_defines, nullptr);
 		    def_state = IN_IFDEF;
 		}
 		if (ferror (fp))
@@ -1478,7 +1475,7 @@ apply_hunk (struct outstate *outstate, lin where)
 		return false;
 	    assert (outstate->after_newline);
 	    if (R_do_defines) {
-	       fprintf (fp, 1 + not_defined, R_do_defines);
+	       putline (fp, 1 + not_defined, R_do_defines, nullptr);
 	       if (ferror (fp))
 		write_fatal ();
 	       def_state = IN_IFNDEF;
@@ -1495,7 +1492,7 @@ apply_hunk (struct outstate *outstate, lin where)
 	    while (pch_char (old) == '!');
 
 	    if (R_do_defines) {
-		fputs (outstate->after_newline + else_defined, fp);
+		Fputs (outstate->after_newline + else_defined, fp);
 		if (ferror (fp))
 		  write_fatal ();
 		def_state = IN_ELSE;
@@ -1514,7 +1511,7 @@ apply_hunk (struct outstate *outstate, lin where)
 	    old++;
 	    new++;
 	    if (R_do_defines && def_state != OUTSIDE) {
-		fputs (outstate->after_newline + end_defined, fp);
+		Fputs (outstate->after_newline + end_defined, fp);
 		if (ferror (fp))
 		  write_fatal ();
 		outstate->after_newline = true;
@@ -1527,12 +1524,12 @@ apply_hunk (struct outstate *outstate, lin where)
 	    return false;
 	if (R_do_defines) {
 	    if (def_state == OUTSIDE) {
-		fprintf (fp, outstate->after_newline + if_defined,
-			 R_do_defines);
+		putline (fp, outstate->after_newline + if_defined,
+			 R_do_defines, nullptr);
 		def_state = IN_IFDEF;
 	    }
 	    else if (def_state == IN_IFNDEF) {
-		fputs (outstate->after_newline + else_defined, fp);
+		Fputs (outstate->after_newline + else_defined, fp);
 		def_state = IN_ELSE;
 	    }
 	    if (ferror (fp))
@@ -1542,8 +1539,8 @@ apply_hunk (struct outstate *outstate, lin where)
 
 	do
 	  {
-	    if (! outstate->after_newline  &&  putc ('\n', fp) == EOF)
-	      write_fatal ();
+	    if (!outstate->after_newline)
+	      Fputc ('\n', fp);
 	    outstate->after_newline = pch_write_line (new, fp);
 	    outstate->zero_output = false;
 	    new++;
@@ -1551,7 +1548,7 @@ apply_hunk (struct outstate *outstate, lin where)
 	while (new <= pat_end && pch_char (new) == '+');
     }
     if (R_do_defines && def_state != OUTSIDE) {
-	fputs (outstate->after_newline + end_defined, fp);
+	Fputs (outstate->after_newline + end_defined, fp);
 	if (ferror (fp))
 	  write_fatal ();
 	outstate->after_newline = true;
@@ -1563,13 +1560,13 @@ apply_hunk (struct outstate *outstate, lin where)
 /* Create an output file.  */
 
 static FILE *
-create_output_file (char const *name, int open_flags)
+create_output_file (struct outfile *out, int open_flags)
 {
-  int fd = create_file (name, O_WRONLY | binary_transput | open_flags,
+  int fd = create_file (out, O_WRONLY | binary_transput | open_flags,
 			instat.st_mode, true);
   FILE *f = fdopen (fd, binary_transput ? "wb" : "w");
   if (! f)
-    pfatal ("Can't create file %s", quotearg (name));
+    pfatal ("Can't create file %s", quotearg (out->name));
   return f;
 }
 
@@ -1578,26 +1575,31 @@ create_output_file (char const *name, int open_flags)
 static void
 init_output (struct outstate *outstate)
 {
-  outstate->ofp = NULL;
+  outstate->ofp = nullptr;
   outstate->after_newline = true;
   outstate->zero_output = true;
 }
 
+/* GCC misunderstands dup2; see
+   <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109839>.  */
+#if 13 <= __GNUC__
+# pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#endif
+
 static FILE *
-open_outfile (char const *name)
+open_outfile (char *name)
 {
   if (strcmp (name, "-") != 0)
-    return create_output_file (name, 0);
+    return create_output_file (&(struct outfile) { .name = name }, 0);
   else
     {
-      FILE *ofp;
-      int stdout_dup = dup (fileno (stdout));
-      if (stdout_dup == -1)
+      int stdout_dup = dup (STDOUT_FILENO);
+      if (stdout_dup < 0)
 	pfatal ("Failed to duplicate standard output");
-      ofp = fdopen (stdout_dup, "a");
+      FILE *ofp = fdopen (stdout_dup, "a");
       if (! ofp)
 	pfatal ("Failed to duplicate standard output");
-      if (dup2 (fileno (stderr), fileno (stdout)) == -1)
+      if (dup2 (STDERR_FILENO, STDOUT_FILENO) < 0)
 	pfatal ("Failed to redirect messages to standard error");
       /* FIXME: Do we need to switch stdout_dup into O_BINARY mode here? */
       return ofp;
@@ -1610,25 +1612,21 @@ static void
 init_reject (char const *outname)
 {
   int fd;
-  fd = make_tempfile (&TMPREJNAME, 'r', outname, O_WRONLY | binary_transput,
-		      0666);
-  if (fd == -1)
-    pfatal ("Can't create temporary file %s", TMPREJNAME);
-  TMPREJNAME_needs_removal = true;
+  fd = make_tempfile (&tmprej, 'r', outname, O_WRONLY | binary_transput, 0666);
+  if (fd < 0)
+    pfatal ("Can't create temporary file %s", tmprej.name);
   rejfp = fdopen (fd, binary_transput ? "wb" : "w");
   if (! rejfp)
-    pfatal ("Can't open stream for file %s", quotearg (TMPREJNAME));
+    pfatal ("Can't open stream for file %s", quotearg (tmprej.name));
 }
 
 /* Copy input file to output, up to wherever hunk is to be applied. */
 
 bool
-copy_till (struct outstate *outstate, lin lastline)
+copy_till (struct outstate *outstate, idx_t lastline)
 {
-    lin R_last_frozen_line = last_frozen_line;
+    idx_t R_last_frozen_line = last_frozen_line;
     FILE *fp = outstate->ofp;
-    char const *s;
-    size_t size;
 
     if (R_last_frozen_line > lastline)
       {
@@ -1637,13 +1635,14 @@ copy_till (struct outstate *outstate, lin lastline)
       }
     while (R_last_frozen_line < lastline)
       {
-	s = ifetch (++R_last_frozen_line, false, &size);
-	if (size)
+	R_last_frozen_line++;
+	struct iline line = ifetch (R_last_frozen_line);
+	if (line.size)
 	  {
-	    if ((! outstate->after_newline  &&  putc ('\n', fp) == EOF)
-		|| ! fwrite (s, sizeof *s, size, fp))
-	      write_fatal ();
-	    outstate->after_newline = s[size - 1] == '\n';
+	    if (!outstate->after_newline)
+	      Fputc ('\n', fp);
+	    Fwrite (line.ptr, 1, line.size, fp);
+	    outstate->after_newline = line.ptr[line.size - 1] == '\n';
 	    outstate->zero_output = false;
 	  }
       }
@@ -1657,13 +1656,7 @@ static bool
 spew_output (struct outstate *outstate, struct stat *st)
 {
     if (debug & 256)
-      {
-	char numbuf0[LINENUM_LENGTH_BOUND + 1];
-	char numbuf1[LINENUM_LENGTH_BOUND + 1];
-	say ("il=%s lfl=%s\n",
-	     format_linenum (numbuf0, input_lines),
-	     format_linenum (numbuf1, last_frozen_line));
-      }
+      say ("il=%td lfl=%td\n", input_lines, last_frozen_line);
 
     if (last_frozen_line < input_lines)
       if (! copy_till (outstate, input_lines))
@@ -1671,11 +1664,9 @@ spew_output (struct outstate *outstate, struct stat *st)
 
     if (outstate->ofp && ! outfile)
       {
-	if (fflush (outstate->ofp) != 0
-	    || fstat (fileno (outstate->ofp), st) != 0
-	    || fclose (outstate->ofp) != 0)
+	Fflush (outstate->ofp);
+	if (fstat (fileno (outstate->ofp), st) < 0)
 	  write_fatal ();
-	outstate->ofp = 0;
       }
 
     return true;
@@ -1684,24 +1675,20 @@ spew_output (struct outstate *outstate, struct stat *st)
 /* Does the patch pattern match at line base+offset? */
 
 static bool
-patch_match (lin base, lin offset, lin prefix_fuzz, lin suffix_fuzz)
+patch_match (idx_t base, ptrdiff_t offset, idx_t prefix_fuzz, idx_t suffix_fuzz)
 {
-    lin pline = 1 + prefix_fuzz;
-    lin iline;
-    lin pat_lines = pch_ptrn_lines () - suffix_fuzz;
-    size_t size;
-    char const *p;
+    idx_t pat_lines = pch_ptrn_lines () - suffix_fuzz;
 
-    for (iline=base+offset+prefix_fuzz; pline <= pat_lines; pline++,iline++) {
-	p = ifetch (iline, offset >= 0, &size);
+    for (idx_t pline = 1 + prefix_fuzz; pline <= pat_lines; pline++) {
+	struct iline line = ifetch (pline - 1 + base + offset);
 	if (canonicalize_ws) {
-	    if (!similar(p, size,
+	    if (!similar(line.ptr, line.size,
 			 pfetch(pline),
 			 pch_line_len(pline) ))
 		return false;
 	}
-	else if (size != pch_line_len (pline)
-		 || memcmp (p, pfetch (pline), size) != 0)
+	else if (line.size != pch_line_len (pline)
+		 || memcmp (line.ptr, pfetch (pline), line.size) != 0)
 	    return false;
     }
     return true;
@@ -1710,34 +1697,31 @@ patch_match (lin base, lin offset, lin prefix_fuzz, lin suffix_fuzz)
 /* Check if the line endings in the input file and in the patch differ. */
 
 static bool
-check_line_endings (lin where)
+check_line_endings (idx_t where)
 {
-  char const *p;
-  size_t size;
-  bool input_crlf, patch_crlf;
-
-  p = pfetch (1);
-  size = pch_line_len (1);
+  char const *p = pfetch (1);
+  idx_t size = pch_line_len (1);
   if (! size)
     return false;
-  patch_crlf = size >= 2 && p[size - 2] == '\r' && p[size - 1] == '\n';
+  bool patch_crlf = 2 <= size && p[size - 2] == '\r' && p[size - 1] == '\n';
 
   if (! input_lines)
     return false;
   if (where > input_lines)
     where = input_lines;
-  p = ifetch (where, false, &size);
-  if (! size)
+  struct iline line = ifetch (where);
+  if (! line.size)
     return false;
-  input_crlf = size >= 2 && p[size - 2] == '\r' && p[size - 1] == '\n';
-
+  bool input_crlf = (2 <= line.size
+		     && line.ptr[line.size - 2] == '\r'
+		     && line.ptr[line.size - 1] == '\n');
   return patch_crlf != input_crlf;
 }
 
 /* Do two lines match with canonicalized white space? */
 
 bool
-similar (char const *a, size_t alen, char const *b, size_t blen)
+similar (char const *a, idx_t alen, char const *b, idx_t blen)
 {
   /* Ignore presence or absence of trailing newlines.  */
   alen  -=  alen && a[alen - 1] == '\n';
@@ -1745,16 +1729,16 @@ similar (char const *a, size_t alen, char const *b, size_t blen)
 
   for (;;)
     {
-      if (!blen || (*b == ' ' || *b == '\t'))
+      if (!blen || c_isblank (*b))
 	{
-	  while (blen && (*b == ' ' || *b == '\t'))
+	  while (blen && c_isblank (*b))
 	    b++, blen--;
 	  if (alen)
 	    {
-	      if (!(*a == ' ' || *a == '\t'))
+	      if (!c_isblank (*a))
 		return false;
 	      do a++, alen--;
-	      while (alen && (*a == ' ' || *a == '\t'));
+	      while (alen && c_isblank (*a));
 	    }
 	  if (!alen || !blen)
 	    return alen == blen;
@@ -1772,18 +1756,14 @@ struct file_to_delete {
   char *name;
   struct stat st;
   bool backup;
+  struct file_to_delete *next;
 };
 
-static gl_list_t files_to_delete;
+static struct file_to_delete *files_to_delete;
+static struct file_to_delete **files_to_delete_tail = &files_to_delete;
 
 static void
-init_files_to_delete (void)
-{
-  files_to_delete = gl_list_create_empty (GL_LINKED_LIST, NULL, NULL, NULL, true);
-}
-
-static void
-delete_file_later (const char *name, const struct stat *st, bool backup)
+delete_file_later (char *name, const struct stat *st, bool backup)
 {
   struct file_to_delete *file_to_delete;
   struct stat st_tmp;
@@ -1798,89 +1778,98 @@ delete_file_later (const char *name, const struct stat *st, bool backup)
   file_to_delete->name = xstrdup (name);
   file_to_delete->st = *st;
   file_to_delete->backup = backup;
-  gl_list_add_last (files_to_delete, file_to_delete);
+  file_to_delete->next = nullptr;
+  *files_to_delete_tail = file_to_delete;
+  files_to_delete_tail = &file_to_delete->next;
   insert_file_id (st, DELETE_LATER);
 }
 
 static void
 delete_files (void)
 {
-  gl_list_iterator_t iter;
-  const void *elt;
-
-  iter = gl_list_iterator (files_to_delete);
-  while (gl_list_iterator_next (&iter, &elt, NULL))
+  struct file_to_delete *next;
+  for (struct file_to_delete *f = files_to_delete; f; f = next)
     {
-      const struct file_to_delete *file_to_delete = elt;
-
-      if (lookup_file_id (&file_to_delete->st) == DELETE_LATER)
+      if (lookup_file_id (&f->st) == DELETE_LATER)
 	{
-	  mode_t mode = file_to_delete->st.st_mode;
+	  mode_t mode = f->st.st_mode;
 
 	  if (verbosity == VERBOSE)
 	    say ("Removing %s %s\n",
 		 S_ISLNK (mode) ? "symbolic link" : "file",
-		 quotearg (file_to_delete->name));
-	  move_file (0, 0, 0, file_to_delete->name, mode,
-		     file_to_delete->backup);
-	  removedirs (file_to_delete->name);
+		 quotearg (f->name));
+	  move_file (nullptr, nullptr, f->name, mode, f->backup);
+	  removedirs (f->name);
 	}
+      next = f->next;
     }
-  gl_list_iterator_free (&iter);
 }
 
 /* Putting output files into place and removing them. */
 
 struct file_to_output {
-  char *from;
+  struct outfile from;
   struct stat from_st;
-  char *to;
+  char *volatile to;
   mode_t mode;
   bool backup;
+  struct file_to_output *volatile next;
 };
 
-static gl_list_t files_to_output;
+static struct file_to_output *volatile files_to_output;
+static struct file_to_output *volatile *files_to_output_tail =
+  &files_to_output;
 
 static void
-output_file_later (char const *from, bool *from_needs_removal, const struct stat *from_st,
+output_file_later (struct outfile *from, const struct stat *from_st,
 		   char const *to, mode_t mode, bool backup)
 {
-  struct file_to_output *file_to_output;
+  idx_t tosize = to ? strlen (to) + 1 : 0;
+  struct file_to_output *f = ximalloc (sizeof *f + tosize);
+  char *alloc = from->alloc;
+  f->from.name = f->from.alloc = alloc ? alloc : xstrdup (from->name);
+  if (alloc)
+    from->alloc = nullptr;
+  f->from.exists = alloc ? from->exists : volatilize (f->from.alloc);
+  f->from.temporary = from->temporary;
+  f->from_st = *from_st;
+  f->to = to ? memcpy (f + 1, to, tosize) : nullptr;
+  f->mode = mode;
+  f->backup = backup;
+  f->next = nullptr;
 
-  file_to_output = xmalloc (sizeof *file_to_output);
-  file_to_output->from = xstrdup (from);
-  file_to_output->from_st = *from_st;
-  file_to_output->to = to ? xstrdup (to) : NULL;
-  file_to_output->mode = mode;
-  file_to_output->backup = backup;
-  gl_list_add_last (files_to_output, file_to_output);
-  if (from_needs_removal)
-    *from_needs_removal = false;
+  /* In a critical section, transfer ownership from FROM to F->from.  */
+  defer_signals ();
+  *files_to_output_tail = f;
+  from->exists = nullptr;
+  undefer_signals ();
+
+  files_to_output_tail = &f->next;
 }
 
 static void
-output_file_now (char const *from, bool *from_needs_removal,
-		 const struct stat *from_st, char const *to,
+output_file_now (struct outfile *from,
+		 const struct stat *from_st, char *to,
 		 mode_t mode, bool backup)
 {
-  if (to == NULL)
+  if (!to)
     {
       if (backup)
-	create_backup (from, from_st, true);
+	create_backup (from->name, from_st, true);
     }
   else
     {
-      assert (from_st->st_size != -1);
-      move_file (from, from_needs_removal, from_st, to, mode, backup);
+      assert (0 <= from_st->st_size);
+      move_file (from, from_st, to, mode, backup);
     }
 }
 
 static void
-output_file (char const *from, bool *from_needs_removal,
-	     const struct stat *from_st, char const *to,
+output_file (struct outfile *from,
+	     const struct stat *from_st, char *to,
 	     const struct stat *to_st, mode_t mode, bool backup)
 {
-  if (from == NULL)
+  if (!from)
     {
       /* Remember which files should be deleted and only delete them when the
 	 entire input to patch has been processed.  This allows to correctly
@@ -1888,7 +1877,7 @@ output_file (char const *from, bool *from_needs_removal,
 
       delete_file_later (to, to_st, backup);
     }
-  else if (pch_git_diff () && pch_says_nonexistent (reverse) != 2)
+  else if (pch_git_diff () && pch_says_nonexistent (reverse_flag) != 2)
     {
       /* In git-style diffs, the "before" state of each patch refers to the initial
 	 state before modifying any files, input files can be referenced more than
@@ -1904,101 +1893,156 @@ output_file (char const *from, bool *from_needs_removal,
 	 concatenated git-style diffs.
       */
 
-      output_file_later (from, from_needs_removal, from_st, to, mode, backup);
+      output_file_later (from, from_st, to, mode, backup);
     }
   else
-    output_file_now (from, from_needs_removal, from_st, to, mode, backup);
+    output_file_now (from, from_st, to, mode, backup);
 }
 
-static void
-dispose_file_to_output (const void *elt)
-{
-  const struct file_to_output *file_to_output = elt;
+/* A root to pacify -fsanitize=address if it is being used.  */
+#if SANITIZE_ADDRESS
+extern struct file_to_output *volatile files_to_output_root;
+struct file_to_output *volatile files_to_output_root
+  ATTRIBUTE_EXTERNALLY_VISIBLE;
+#endif
 
-  free (file_to_output->from);
-  free (file_to_output->to);
-}
+/* Output files that were delayed until now.
+   If ST, output only files up to and including ST.
 
-static void
-init_files_to_output (void)
-{
-  files_to_output = gl_list_create_empty (GL_LINKED_LIST, NULL, NULL,
-					  dispose_file_to_output, true);
-}
-
-static void
-gl_list_clear (gl_list_t list)
-{
-  while (gl_list_size (list) > 0)
-    gl_list_remove_at (list, 0);
-}
+   EXITING == 0 is the typical case.
+   If EXITING != 0, we are about to exit so freeing memory is optional.
+   If EXITING < 0, we are in a signal handler (and in a critical section);
+   so ignore ST, remove temporaries in an async-signal-safe way,
+   and of course do not attempt to free memory.  */
 
 static void
-output_files (struct stat const *st)
+output_files (struct stat const *st, int exiting)
 {
-  gl_list_iterator_t iter;
-  const void *elt;
-
-  iter = gl_list_iterator (files_to_output);
-  while (gl_list_iterator_next (&iter, &elt, NULL))
+  struct file_to_output *next;
+  struct file_to_output *f = files_to_output;
+#if SANITIZE_ADDRESS
+  files_to_output_root = f;
+#endif
+  for (; f; f = next)
     {
-      const struct file_to_output *file_to_output = elt;
-      bool from_needs_removal = true;
-      struct stat const *from_st = &file_to_output->from_st;
+      char *to = f->to;
+      next = f->next;
+      bool early_return;
 
-      output_file_now (file_to_output->from, &from_needs_removal,
-		       from_st, file_to_output->to,
-		       file_to_output->mode, file_to_output->backup);
-      if (file_to_output->to && from_needs_removal)
-	safe_unlink (file_to_output->from);
-
-      if (st && st->st_dev == from_st->st_dev && st->st_ino == from_st->st_ino)
+      if (exiting < 0)
 	{
-	  /* Free the list up to here. */
-	  for (;;)
+	  /* Do not call 'safe_unlink' as it is not async-signal-safe.
+	     'unlink' should be good enough here, as we already
+	     checked the file's parent directory.  */
+	  if (to)
 	    {
-	      const void *elt2 = gl_list_get_at (files_to_output, 0);
-	      gl_list_remove_at (files_to_output, 0);
-	      if (elt == elt2)
-		break;
+	      char volatile *exists = f->from.exists;
+	      if (exists)
+		unlink (devolatilize (exists));
 	    }
-	  gl_list_iterator_free (&iter);
-	  return;
+	  early_return = false;
 	}
+      else
+	{
+	  struct stat const *from_st = &f->from_st;
+
+	  output_file_now (&f->from, from_st, to, f->mode, f->backup);
+
+	  defer_signals ();
+	  if (to)
+	    {
+	      char volatile *exists = f->from.exists;
+	      if (exists)
+		safe_unlink (devolatilize (exists));
+	    }
+	  files_to_output = next;
+	  undefer_signals ();
+
+	  early_return = (st
+			  && st->st_dev == from_st->st_dev
+			  && st->st_ino == from_st->st_ino);
+	}
+
+      if (!exiting)
+	{
+	  free (f->from.alloc);
+	  free (f);
+	}
+
+      if (!next)
+	files_to_output_tail = &files_to_output;
+
+      if (early_return)
+	return;
     }
-  gl_list_iterator_free (&iter);
-  gl_list_clear (files_to_output);
 }
 
-/* Fatal exit with cleanup. */
+/* Clean up temp files after a signal.  This function is async-signal-safe.  */
 
 void
-fatal_exit (int sig)
+fatal_cleanup (void)
 {
-  cleanup ();
-
-  if (sig)
-    exit_with_signal (sig);
-
-  exit (2);
+  cleanup_remove ();
+  output_files (nullptr, -1);
 }
 
-static void
-remove_if_needed (char const *name, bool *needs_removal)
+/* Clean up temp files and exit after a fatal error.  */
+
+void
+fatal_exit (void)
 {
-  if (*needs_removal)
+  defer_signals ();
+  cleanup_remove ();
+  undefer_signals ();
+  output_files (nullptr, 1);
+  exit (EXIT_TROUBLE);
+}
+
+/* Remove TMP's file if it exists.
+   This function is async-signal-safe.  */
+static void
+remove_if_needed (struct outfile *tmp)
+{
+  char volatile *exists = tmp->exists;
+  if (exists)
     {
-      safe_unlink (name);
-      *needs_removal = false;
+      safe_unlink (devolatilize (exists));
+      tmp->exists = nullptr;
     }
 }
 
+/* Remove per-file temporary files.
+   This function is async-signal-safe.  */
 static void
-cleanup (void)
+perfile_cleanup_remove (void)
 {
-  remove_if_needed (TMPINNAME, &TMPINNAME_needs_removal);
-  remove_if_needed (TMPOUTNAME, &TMPOUTNAME_needs_removal);
-  remove_if_needed (TMPPATNAME, &TMPPATNAME_needs_removal);
-  remove_if_needed (TMPREJNAME, &TMPREJNAME_needs_removal);
-  output_files (NULL);
+  remove_if_needed (&tmped);
+  remove_if_needed (&tmpout);
+  remove_if_needed (&tmprej);
+}
+
+/* Remove all temporary files.
+   This function is async-signal-safe.  */
+static void
+cleanup_remove (void)
+{
+  remove_if_needed (&tmppat);
+  perfile_cleanup_remove ();
+}
+
+/* Free any storage associated with an output file.  */
+static void
+free_outfile_name (struct outfile *f)
+{
+  free (f->alloc);
+  f->name = f->alloc = nullptr;
+}
+
+/* Free storage associated with per-file temporaries.  */
+static void
+perfile_cleanup_free (void)
+{
+  free_outfile_name (&tmped);
+  free_outfile_name (&tmpout);
+  free_outfile_name (&tmprej);
 }

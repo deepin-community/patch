@@ -1,5 +1,5 @@
 # Library for simple test scripts
-# Copyright (C) 2009, 2011-2012 Free Software Foundation, Inc.
+# Copyright 2009-2025 Free Software Foundation, Inc.
 #
 # Copying and distribution of this file, with or without modification,
 # in any medium, are permitted without royalty provided the copyright
@@ -7,7 +7,7 @@
 
 # FIXME: Requires a version of diff that understands "-u".
 
-require_gnu_diff() {
+_require_gnu_diff() {
     case "`diff --version 2> /dev/null`" in
     *GNU*)
 	;;
@@ -17,10 +17,55 @@ require_gnu_diff() {
     esac
 }
 
+_try_chmod() {
+    chmod "$1" "$2" && test "`ls -l "$2" | cut -b2-10`" = "$3"
+}
+
+_require_chmod() {
+    tmp=`mktemp working-chmod.XXXXXXXX`
+    if ! _try_chmod 644 "$tmp" "rw-r--r--" || \
+       ! _try_chmod 600 "$tmp" "rw-------"; then
+	rm -f "$tmp"
+	echo "This test requires chmod support" >&2
+	exit 77
+    fi
+    rm -f "$tmp"
+}
+
+_require_hardlinks() {
+    tmpdir=`mktemp -d hardlinks.XXXXXXXX`
+    if ! touch "$tmpdir/f" ||
+       ! ln "$tmpdir/f" "$tmpdir/g"; then
+	rm -rf "$tmpdir"
+	echo "This test requires hardlink support" >&2
+	exit 77
+    fi
+    rm -rf "$tmpdir"
+}
+
+_require_symlinks() {
+    tmpdir=`mktemp -d hardlinks.XXXXXXXX`
+    if ! touch "$tmpdir/f" ||
+       ! ln -s "f" "$tmpdir/g"; then
+	rm -rf "$tmpdir"
+	echo "This test requires symlink support" >&2
+	exit 77
+    fi
+    rm -rf "$tmpdir"
+}
+
+_require_special_characters() {
+    if ! tmp=`mktemp '	 '.XXXXXXXX`; then
+	echo "This test requires special character support in filenames" >&2
+	exit 77
+    fi
+    rm -f "$tmp"
+}
+
 require() {
     utility="$1"
-    if type require_${utility} > /dev/null 2> /dev/null; then
-	require_${utility}
+    if type _require_${utility} > /dev/null 2> /dev/null; then
+	_require_${utility}
     elif ! type "${utility}" > /dev/null 2> /dev/null; then
 	echo "This test requires the ${utility} utility" >&2
 	exit 77
@@ -41,7 +86,7 @@ use_local_patch() {
 
     eval 'patch() {
 	if test -n "$GDB" ; then
-	  echo -e "\n" >&3
+	  printf "\n\n" >&3
 	  gdbserver localhost:53153 $PATCH "$@" 2>&3
 	else
           $PATCH "$@"
@@ -113,22 +158,15 @@ cleanup() {
     exit $status
 }
 
-if test -z "`echo -n`"; then
-    if eval 'test -n "${BASH_LINENO[0]}" 2>/dev/null'; then
-	eval '
-	    _start_test() {
-		echo -n "[${BASH_LINENO[2]}] $* -- "
-	    }'
-    else
-	eval '
-	    _start_test() {
-		echo -n "* $* -- "
-	    }'
-    fi
+if ( eval 'test -n "${BASH_LINENO[0]}"' 2>/dev/null ); then
+    eval '
+	_start_test() {
+	    printf "[${BASH_LINENO[2]}] %s -- " "$*"
+	}'
 else
     eval '
 	_start_test() {
-	    echo "* $*"
+	    printf "* %s -- " "$*"
 	}'
 fi
 

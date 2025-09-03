@@ -1,9 +1,9 @@
 /* Rename a file relative to open directories.
-   Copyright 2017-2018 Free Software Foundation, Inc.
+   Copyright 2017-2025 Free Software Foundation, Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -16,10 +16,10 @@
 
 #include <config.h>
 #include <stdio.h>
-#include "renameat2.h"
+#include "renameatu.h"
 
 int
 renameat (int fd1, char const *src, int fd2, char const *dst)
 {
-  return renameat2 (fd1, src, fd2, dst, 0);
+  return renameatu (fd1, src, fd2, dst, 0);
 }

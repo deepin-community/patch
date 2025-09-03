@@ -1,6 +1,26 @@
+Changes in version 2.8:
+
+* The --follow-symlinks option now applies to output files as well as input.
+* 'patch' now supports file timestamps after 2038 even on traditional
+  GNU/Linux platforms where time_t defaults to 32 bits.
+* 'patch' no longer creates files with names containing newlines,
+  as encouraged by POSIX.1-2024.
+* Patches can no longer contain NUL ('\0') bytes in diff directive lines.
+  These bytes would otherwise cause unpredictable behavior.
+* Patches can now contain sequences of spaces and tabs around line numbers
+  and in other places where POSIX requires support for these sequences.
+* --enable-gcc-warnings no longer uses expensive static checking.
+  Use --enable-gcc-warnings=expensive if you still want it.
+* Fix undefined or ill-defined behavior in unusual cases, such as very
+  large sizes, possible stack overflow, I/O errors, memory exhaustion,
+  races with other processes, and signals arriving at inopportune moments.
+* Remove old "Plan B" code, designed for machines with 16-bit pointers.
+* Assume C99 or later; previously it assumed C89 or later.
+* Port to current GCC, Autoconf, Gnulib, etc.
+
 Changes in version 2.7.6:
 
-* Files specififed on the command line are no longer verified to be inside the
+* Files specified on the command line are no longer verified to be inside the
   current working directory, so commands like "patch -i foo.diff ../foo" will
   work again.
 * Various fixes.
@@ -109,7 +129,7 @@ Changes in version 2.6:
   line endings in patches.  This allows to preserve CRs even in mangled
   patches, or in patches generated on non-POSIX systems and without the
   --binary option.
-* Backup files for nonexisting files are now created with default
+* Backup files for nonexistent files are now created with default
   permissions rather than with mode 0: backup files with mode 0 were
   causing problems with applications which do not expect unreadable
   files.
@@ -135,7 +155,7 @@ Changes in version 2.5.6:
 
 * File names in context patches may now contain spaces, so long
   as the context patch headers use a tab to separate the file name
-  from the time stamp.
+  from the timestamp.
 * Perforce is now supported.
 * Patch lines beginning with "#" are comments and are ignored.
 
@@ -342,22 +362,19 @@ Changes in version 2.0.12g8:
 
 
 
-Copyright (C) 1992-1993, 1997-2003, 2006, 2009, 2011-2012 Free Software
-Foundation, Inc.
+Copyright 1992-2025 Free Software Foundation, Inc.
 
 This file is part of GNU Patch.
 
-This program is free software; you can redistribute it and/or modify
+This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2, or (at your option)
-any later version.
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-This program is distributed in the hope that they will be useful,
+This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
-along with this program; see the file COPYING.  If not, write to
-the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
-Boston, MA 02110-1301, USA.
+along with this program.  If not, see <http://www.gnu.org/licenses/>.

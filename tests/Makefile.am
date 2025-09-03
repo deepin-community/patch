@@ -1,5 +1,4 @@
-# Copyright (C) 1989-1993, 1997-1999, 2002-2003, 2006, 2009-2012 Free Software
-# Foundation, Inc.
+# Copyright 1989-2025 Free Software Foundation, Inc.
 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -32,6 +31,7 @@ TESTS = \
 	crlf-handling \
 	dash-o-append \
 	deep-directories \
+	ed-style \
 	empty-files \
 	false-match \
 	fifo \
@@ -42,6 +42,7 @@ TESTS = \
 	git-cleanup \
 	garbage \
 	global-reject-files \
+	hardlinks \
 	inname \
 	line-numbers \
 	merge \
@@ -49,22 +50,29 @@ TESTS = \
 	mixed-patch-types \
 	munged-context-format \
 	need-filename \
+	no-backup \
 	no-mode-change-git-diff \
 	no-newline-triggers-assert \
 	preserve-c-function-names \
 	preserve-mode-and-timestamp \
 	quoted-filenames \
 	read-only-files \
+	regression-abe92e8010ab \
 	reject-format \
 	remember-backup-files \
 	remember-reject-files \
 	remove-directories \
 	symlinks \
-	unmodified-files
+	unmodified-files \
+	unusual-blanks
 
 XFAIL_TESTS = \
 	dash-o-append \
 	context-format
+if OS_IS_HAIKU
+XFAIL_TESTS += \
+	preserve-mode-and-timestamp
+endif
 
 EXTRA_DIST = \
 	$(TESTS) \

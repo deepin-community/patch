@@ -1,5 +1,4 @@
-# Copyright (C) 1989-1993, 1997-1999, 2002-2003, 2006, 2009-2012 Free Software
-# Foundation, Inc.
+# Copyright 1989-2025 Free Software Foundation, Inc.
 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -36,8 +35,10 @@ patch_SOURCES = \
 	list.h
 
 AM_CPPFLAGS = -I$(top_builddir)/lib -I$(top_srcdir)/lib
-patch_LDADD = $(LDADD) $(top_builddir)/lib/libpatch.a $(LIB_CLOCK_GETTIME) \
-	      $(LIB_XATTR) $(LIB_EACCESS)
+patch_LDADD = $(LDADD) $(top_builddir)/lib/libpatch.a \
+ $(CLOCK_TIME_LIB) $(EUIDACCESS_LIBGEN) $(GETRANDOM_LIB) \
+ $(HARD_LOCALE_LIB) $(LIBINTL) $(MBRTOWC_LIB) $(SETLOCALE_NULL_LIB) \
+ $(LIB_XATTR)
 
 if ENABLE_MERGE
   patch_SOURCES += merge.c

@@ -1,10 +1,12 @@
-# serial 8
-# See if we need to provide symlinkat replacement.
-
-dnl Copyright (C) 2009-2018 Free Software Foundation, Inc.
+# symlinkat.m4
+# serial 13
+dnl Copyright (C) 2009-2025 Free Software Foundation, Inc.
 dnl This file is free software; the Free Software Foundation
 dnl gives unlimited permission to copy and/or distribute it,
 dnl with or without modifications, as long as this notice is preserved.
+dnl This file is offered as-is, without any warranty.
+
+# See if we need to provide symlinkat replacement.
 
 # Written by Eric Blake.
 
@@ -14,9 +16,12 @@ AC_DEFUN([gl_FUNC_SYMLINKAT],
   AC_REQUIRE([gl_FUNC_OPENAT])
   AC_REQUIRE([gl_USE_SYSTEM_EXTENSIONS])
   AC_REQUIRE([AC_CANONICAL_HOST]) dnl for cross-compiles
-  AC_CHECK_FUNCS_ONCE([symlinkat])
+  gl_CHECK_FUNCS_ANDROID([symlinkat], [[#include <unistd.h>]])
   if test $ac_cv_func_symlinkat = no; then
     HAVE_SYMLINKAT=0
+    case "$gl_cv_onwards_func_symlinkat" in
+      future*) REPLACE_SYMLINKAT=1 ;;
+    esac
   else
     AC_CACHE_CHECK([whether symlinkat handles trailing slash correctly],
       [gl_cv_func_symlinkat_works],
@@ -37,10 +42,14 @@ AC_DEFUN([gl_FUNC_SYMLINKAT],
          [gl_cv_func_symlinkat_works=yes],
          [gl_cv_func_symlinkat_works=no],
          [case "$host_os" in
-                           # Guess yes on glibc systems.
-            *-gnu* | gnu*) gl_cv_func_symlinkat_works="guessing yes" ;;
-                           # If we don't know, assume the worst.
-            *)             gl_cv_func_symlinkat_works="guessing no" ;;
+                             # Guess yes on Linux systems.
+            linux-* | linux) gl_cv_func_symlinkat_works="guessing yes" ;;
+                             # Guess yes on systems that emulate the Linux system calls.
+            midipix*)        gl_cv_func_symlinkat_works="guessing yes" ;;
+                             # Guess yes on glibc systems.
+            *-gnu* | gnu*)   gl_cv_func_symlinkat_works="guessing yes" ;;
+                             # If we don't know, obey --enable-cross-guesses.
+            *)               gl_cv_func_symlinkat_works="$gl_cross_guess_normal" ;;
           esac
          ])
       rm -f conftest.f conftest.link conftest.lnk2])

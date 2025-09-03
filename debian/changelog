@@ -1,3 +1,25 @@
+patch (2.8-2) unstable; urgency=medium
+
+  [ Samuel Thibault <sthibault@debian.org> ]
+  * Pass --disable-year2038 for hurd-i386 case to fix FTBFS (closes: #815457).
+
+  [ Laszlo Boszormenyi (GCS) ]
+  * Backport upstream fix: skip read-only check when output file specified.
+
+ -- Laszlo Boszormenyi (GCS) <gcs@debian.org>  Fri, 13 Jun 2025 20:59:38 +0200
+
+patch (2.8-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Backport upstream fixes:
+    - add some missing filename quoting,
+    - reject empty filenames.
+  * Use DEP5 copyright format.
+  * Update debhelper level to 13 .
+  * Update Standards-Version to 4.7.2 .
+
+ -- Laszlo Boszormenyi (GCS) <gcs@debian.org>  Sun, 06 Apr 2025 21:10:31 +0200
+
 patch (2.7.6-7) unstable; urgency=medium
 
   * Backport upstream fixes:
@@ -494,7 +516,7 @@ patch (2.1-11) unstable; urgency=high
     detect long filename support
   * Waiting on Larry Wall to see if patch will have to be moved to
     non-free.
-  
+
  -- Darren Stalder <torin@daft.com>  Mon, 10 Feb 1997 03:18:58 -0800
 
 patch (2.1-10) unstable; urgency=low

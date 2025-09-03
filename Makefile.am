@@ -1,5 +1,4 @@
-# Copyright (C) 1989-1993, 1997-1999, 2002-2003, 2006, 2009-2012 Free Software
-# Foundation, Inc.
+# Copyright 1989-2025 Free Software Foundation, Inc.
 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,6 +22,7 @@ dist_man1_MANS = patch.man
 EXTRA_DIST = \
 	ChangeLog-2011 \
 	cfg.mk \
+	m4/gnulib-cache.m4 \
 	m4/mkdir.m4 \
 	m4/setmode.m4 \
 	bootstrap \
