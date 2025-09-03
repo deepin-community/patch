@@ -1,9 +1,7 @@
 /* utility functions for 'patch' */
 
-/* Copyright (C) 1986 Larry Wall
-
-   Copyright (C) 1992-1993, 1997-1999, 2001-2003, 2006, 2009-2012 Free Software
-   Foundation, Inc.
+/* Copyright 1992-2025 Free Software Foundation, Inc.
+   Copyright 1986 Larry Wall
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -18,43 +16,38 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
 
-#define XTERN extern
+#define UTIL_INLINE _GL_EXTERN_INLINE
+
 #include <common.h>
-#include <dirname.h>
+#include <basename-lgpl.h>
+#include <filename.h>
 #include <hash.h>
 #include <quotearg.h>
-#undef XTERN
-#define XTERN
 #include <util.h>
+#include <utimens.h>
 #include <xalloc.h>
-#include <xmemdup0.h>
 
-#include <getdate.h>
-#include "ignore-value.h"
-#include "error.h"
+#include <parse-datetime.h>
+#include <ignore-value.h>
+#include <error.h>
 
 #include <signal.h>
-#if !defined SIGCHLD && defined SIGCLD
-#define SIGCHLD SIGCLD
-#endif
-#if ! HAVE_RAISE && ! defined raise
-# define raise(sig) kill (getpid (), sig)
-#endif
-
 #include <stdarg.h>
-#include <full-write.h>
+
 #include <tempname.h>
 
 #if USE_XATTR
 # include <attr/error_context.h>
 # include <attr/libattr.h>
-# include <stdarg.h>
-# include "verror.h"
 #endif
 
+#include <pch.h>
 #include <safe.h>
 
+enum backup_type backup_type;
+
 static void makedirs (char const *);
+static void Write (int, void const *, idx_t);
 
 typedef struct
 {
@@ -64,14 +57,28 @@ typedef struct
   bool queued_output;
 } file_id;
 
+/* Convert STR to a pointer to volatile, after making the contents
+   safe to use in a signal handler.  */
+char volatile *
+volatilize (char *str)
+{
+  /* Access the string contents as volatile, to force contents into
+     memory.  This loop is redundant on typical platforms, although
+     the C standard requires it.  */
+  for (char volatile *p = str; *p; p++)
+    continue;
+
+  return str;
+}
+
 /* Return an index for ENTRY into a hash table of size TABLE_SIZE.  */
 
 static size_t
 file_id_hasher (void const *entry, size_t table_size)
 {
   file_id const *e = entry;
-  size_t i = e->ino + e->dev;
-  return i % table_size;
+  uintmax_t ino = e->ino, dev = e->dev;
+  return (ino ^ dev) % table_size;
 }
 
 /* Do ENTRY1 and ENTRY2 refer to the same files?  */
@@ -91,7 +98,7 @@ static Hash_table *file_id_table;
 void
 init_backup_hash_table (void)
 {
-  file_id_table = hash_initialize (0, NULL, file_id_hasher,
+  file_id_table = hash_initialize (0, nullptr, file_id_hasher,
 				   file_id_comparator, free);
   if (!file_id_table)
     xalloc_die ();
@@ -112,7 +119,7 @@ __insert_file_id (struct stat const *st, enum file_id_type type)
    if (!p)
      xalloc_die ();
    if (p == next_slot)
-     next_slot = NULL;
+     next_slot = nullptr;
    p->type = type;
    return p;
 }
@@ -165,7 +172,7 @@ has_queued_output (struct stat const *st)
   return p && p->queued_output;
 }
 
-static bool _GL_ATTRIBUTE_PURE
+static bool ATTRIBUTE_PURE
 contains_slash (const char *s)
 {
   for (; *s; s++)
@@ -174,17 +181,48 @@ contains_slash (const char *s)
   return false;
 }
 
+/* Assuming that a chown-like syscall using file descriptor FD (or a
+   filename-oriented syscall if FD < 0) failed with errno = ERR,
+   return true if the current process lacks appropriate privileges.  */
+
+static bool
+lacks_appropriate_privileges (int fd, int err)
+{
+  if (err == EPERM)
+    return true;
+#ifdef __linux__
+  /* Work around <https://bugs.gnu.org/65599>  */
+  if (0 <= fd && errno == EACCES)
+    return true;
+#endif
+  return false;
+}
+
 #if USE_XATTR
 
-static void
-copy_attr_error (struct error_context *ctx, char const *fmt, ...)
+static void ATTRIBUTE_FORMAT ((_GL_ATTRIBUTE_SPEC_PRINTF_STANDARD, 2, 3))
+copy_attr_error (MAYBE_UNUSED struct error_context *ctx, char const *fmt, ...)
 {
   int err = errno;
   va_list ap;
 
   if (err != ENOSYS && err != ENOTSUP && err != EPERM)
     {
-      /* use verror module to print error message */
+      va_start (ap, fmt);
+      verror (0, err, fmt, ap);
+      va_end (ap);
+    }
+}
+
+static void ATTRIBUTE_FORMAT ((_GL_ATTRIBUTE_SPEC_PRINTF_STANDARD, 2, 3))
+copy_fdattr_error (MAYBE_UNUSED struct error_context *ctx, char const *fmt, ...)
+{
+  int err = errno;
+  va_list ap;
+
+  if (err != ENOSYS && err != ENOTSUP
+      && !lacks_appropriate_privileges (err, 0))
+    {
       va_start (ap, fmt);
       verror (0, err, fmt, ap);
       va_end (ap);
@@ -192,13 +230,14 @@ copy_attr_error (struct error_context *ctx, char const *fmt, ...)
 }
 
 static char const *
-copy_attr_quote (struct error_context *ctx, char const *str)
+copy_attr_quote (MAYBE_UNUSED struct error_context *ctx, char const *str)
 {
   return quotearg (str);
 }
 
 static void
-copy_attr_free (struct error_context *ctx, char const *str)
+copy_attr_free (MAYBE_UNUSED struct error_context *ctx,
+		MAYBE_UNUSED char const *str)
 {
 }
 
@@ -209,15 +248,34 @@ copy_attr_check (const char *name, struct error_context *ctx)
 	return action == 0 || action == ATTR_ACTION_PERMISSIONS;
 }
 
+
 static int
-copy_attr (char const *src_path, char const *dst_path)
+copy_attr (char const *src_path, int src_fd,
+	   char const *dst_path, int dst_fd)
 {
+  /* Pacify GCC through at least GCC 14, which otherwise complains about
+     the ".error = ...".  */
+  #if 4 < __GNUC__ + (8 <= __GNUC_MINOR__)
+  # pragma GCC diagnostic push
+  # pragma GCC diagnostic ignored "-Wsuggest-attribute=format"
+  #endif
+
+  bool copy_with_names = (src_fd < 0) | (dst_fd < 0);
   struct error_context ctx =
   {
-    .error = copy_attr_error,
+    .error = copy_with_names ? copy_attr_error : copy_fdattr_error,
     .quote = copy_attr_quote,
     .quote_free = copy_attr_free
   };
+
+  #if 4 < __GNUC__ + (8 <= __GNUC_MINOR__)
+  # pragma GCC diagnostic pop
+  #endif
+
+  if (0 <= src_fd && 0 <= dst_fd)
+    return attr_copy_fd (src_path, src_fd, dst_path, dst_fd,
+			 copy_attr_check, &ctx);
+
   /* FIXME: We are copying between files we know we can safely access by
    * pathname. A safe_ version of attr_copy_file() might still be slightly
    * more efficient for deep paths. */
@@ -227,7 +285,8 @@ copy_attr (char const *src_path, char const *dst_path)
 #else  /* USE_XATTR */
 
 static int
-copy_attr (char const *src_path, char const *dst_path)
+copy_attr (MAYBE_UNUSED char const *src_path, MAYBE_UNUSED int src_fd,
+	   MAYBE_UNUSED char const *dst_path, MAYBE_UNUSED int dst_fd)
 {
   return 0;
 }
@@ -235,9 +294,9 @@ copy_attr (char const *src_path, char const *dst_path)
 #endif
 
 void
-set_file_attributes (char const *to, enum file_attributes attr,
-		     char const *from, const struct stat *st, mode_t mode,
-		     struct timespec *new_time)
+set_file_attributes (char *to, int tofd, enum file_attributes attr,
+		     char const *from, int fromfd, const struct stat *st,
+		     mode_t mode, struct timespec *new_time)
 {
   if (attr & FA_TIMES)
     {
@@ -249,53 +308,61 @@ set_file_attributes (char const *to, enum file_attributes attr,
 	  times[0] = get_stat_atime (st);
 	  times[1] = get_stat_mtime (st);
 	}
-      if (safe_lutimens (to, times) != 0)
+      int ok = (tofd < 0 ? -1
+		: 0 <= futimens (tofd, times) ? 1
+		: errno == ENOSYS ? -1 : 0);
+      if (!ok || (ok < 0 && safe_lutimens (to, times) < 0))
 	pfatal ("Failed to set the timestamps of %s %s",
 		S_ISLNK (mode) ? "symbolic link" : "file",
 		quotearg (to));
     }
   if (attr & FA_IDS)
     {
+      uid_t uid_1 = -1;
+      gid_t gid_1 = -1;
       static uid_t euid = -1;
       static gid_t egid = -1;
       uid_t uid;
       uid_t gid;
 
-      if (euid == -1)
+      if (euid == uid_1)
         {
 	  euid = geteuid ();
 	  egid = getegid ();
 	}
-      uid = (euid == st->st_uid) ? -1 : st->st_uid;
-      gid = (egid == st->st_gid) ? -1 : st->st_gid;
+      uid = euid == st->st_uid ? uid_1 : st->st_uid;
+      gid = egid == st->st_gid ? gid_1 : st->st_gid;
 
       /* May fail if we are not privileged to set the file owner, or we are
          not in group instat.st_gid.  Ignore those errors.  */
-      if ((uid != -1 || gid != -1)
-	  && safe_lchown (to, uid, gid) != 0
-	  && (errno != EPERM
-	      || (uid != -1
-		  && safe_lchown (to, (uid = -1), gid) != 0
-		  && errno != EPERM)))
+      if ((uid != uid_1 || gid != gid_1)
+	  && ((tofd < 0 ? safe_lchown (to, uid, gid) : fchown (tofd, uid, gid))
+	      < 0)
+	  && (!lacks_appropriate_privileges (tofd, errno)
+	      || (uid != uid_1
+		  && (uid = -1,
+		      ((tofd < 0
+			? safe_lchown (to, uid, gid)
+			: fchown (tofd, uid, gid))
+		       < 0))
+		  && !lacks_appropriate_privileges (tofd, errno))))
 	pfatal ("Failed to set the %s of %s %s",
-		(uid == -1) ? "owner" : "owning group",
+		uid == uid_1 ? "owner" : "owning group",
 		S_ISLNK (mode) ? "symbolic link" : "file",
 		quotearg (to));
     }
   if (attr & FA_XATTRS)
-    if (copy_attr (from, to) != 0
-	&& errno != ENOSYS && errno != ENOTSUP && errno != EPERM)
-      fatal_exit (0);
+    if (copy_attr (from, fromfd, to, tofd) < 0
+	&& errno != ENOSYS && errno != ENOTSUP
+	&& lacks_appropriate_privileges (errno, tofd))
+      fatal_exit ();
   if (attr & FA_MODE)
     {
-#if 0 && defined HAVE_LCHMOD
       /* The "diff --git" format does not store the file permissions of
 	 symlinks, so don't try to set symlink file permissions even on
 	 systems where we could.  */
-      if (lchmod (to, mode))
-#else
-      if (! S_ISLNK (mode) && safe_chmod (to, mode) != 0)
-#endif
+      if (! S_ISLNK (mode)
+	  && (tofd < 0 ? safe_chmod (to, mode) : fchmod (tofd, mode)) < 0)
 	pfatal ("Failed to set the permissions of %s %s",
 		S_ISLNK (mode) ? "symbolic link" : "file",
 		quotearg (to));
@@ -303,15 +370,16 @@ set_file_attributes (char const *to, enum file_attributes attr,
 }
 
 static void
-create_backup_copy (char const *from, char const *to, const struct stat *st,
+create_backup_copy (char *from, char *to, const struct stat *st,
 		    bool to_dir_known_to_exist)
 {
-  copy_file (from, to, NULL, 0, st->st_mode, to_dir_known_to_exist);
-  set_file_attributes (to, FA_TIMES | FA_IDS | FA_MODE, from, st, st->st_mode, NULL);
+  copy_file (from, st, &(struct outfile) { .name = to },
+	     nullptr, 0, st->st_mode, FA_TIMES | FA_IDS | FA_MODE,
+	     to_dir_known_to_exist);
 }
 
 void
-create_backup (char const *to, const struct stat *to_st, bool leave_original)
+create_backup (char *to, const struct stat *to_st, bool leave_original)
 {
   /* When the input to patch modifies the same file more than once, patch only
      backs up the initial version of each file.
@@ -346,12 +414,12 @@ create_backup (char const *to, const struct stat *to_st, bool leave_original)
 	  char const *b = origbase ? origbase : "";
 	  char const *s = origsuff ? origsuff : "";
 	  char const *t = to;
-	  size_t plen = strlen (p);
-	  size_t blen = strlen (b);
-	  size_t slen = strlen (s);
-	  size_t tlen = strlen (t);
+	  idx_t plen = strlen (p);
+	  idx_t blen = strlen (b);
+	  idx_t slen = strlen (s);
+	  idx_t tlen = strlen (t);
 	  char const *o;
-	  size_t olen;
+	  idx_t olen;
 
 	  for (o = t + tlen, olen = 0;
 	       o > t && ! ISSLASH (*(o - 1));
@@ -374,7 +442,7 @@ create_backup (char const *to, const struct stat *to_st, bool leave_original)
 	}
       else
 	{
-	  bakname = find_backup_file_name (to, backup_type);
+	  bakname = find_backup_file_name (AT_FDCWD, to, backup_type);
 	  if (!bakname)
 	    xalloc_die ();
 	}
@@ -388,7 +456,7 @@ create_backup (char const *to, const struct stat *to_st, bool leave_original)
 
 	  try_makedirs_errno = ENOENT;
 	  safe_unlink (bakname);
-	  while ((fd = safe_open (bakname, O_CREAT | O_WRONLY | O_TRUNC, 0666)) < 0)
+	  while ((fd = safe_open (bakname, O_CREAT | O_EXCL | O_WRONLY | O_TRUNC, 0666)) < 0)
 	    {
 	      if (errno != try_makedirs_errno)
 		pfatal ("Can't create file %s", quotearg (bakname));
@@ -428,47 +496,51 @@ create_backup (char const *to, const struct stat *to_st, bool leave_original)
     }
 }
 
-/* Move a file FROM (where *FROM_NEEDS_REMOVAL is nonzero if FROM
-   needs removal when cleaning up at the end of execution, and where
-   *FROMST is FROM's status if known),
+/* Move a file OUTFROM (where *FROMST is OUTFROM's status if known),
    to TO, renaming it if possible and copying it if necessary.
    If we must create TO, use MODE to create it.
-   If FROM is null, remove TO.
-   FROM_NEEDS_REMOVAL must be nonnull if FROM is nonnull.
+   If OUTFROM is null, remove TO.
    and FROMST must be nonnull if both FROM and BACKUP are nonnull.
    Back up TO if BACKUP is true.  */
 
 void
-move_file (char const *from, bool *from_needs_removal,
-	   struct stat const *fromst,
-	   char const *to, mode_t mode, bool backup)
+move_file (struct outfile *outfrom, struct stat const *fromst,
+	   char *to, mode_t mode, bool backup)
 {
   struct stat to_st;
   int to_errno;
 
   to_errno = stat_file (to, &to_st);
   if (backup)
-    create_backup (to, to_errno ? NULL : &to_st, false);
+    create_backup (to, to_errno ? nullptr : &to_st, false);
   if (! to_errno)
     insert_file_id (&to_st, OVERWRITTEN);
 
-  if (from)
+  if (outfrom)
     {
+      char *from = outfrom->name;
       if (S_ISLNK (mode))
 	{
 	  bool to_dir_known_to_exist = false;
 
 	  /* FROM contains the contents of the symlink we have patched; need
 	     to convert that back into a symlink. */
-	  char *buffer = xmalloc (PATH_MAX);
-	  int fd, size = 0, i;
+	  idx_t alloc;
+	  if (ckd_add (&alloc, fromst->st_size, 1))
+	    xalloc_die ();
+	  char *buffer = ximalloc (alloc);
 
-	  if ((fd = safe_open (from, O_RDONLY | O_BINARY, 0)) < 0)
+	  int fd = safe_open (from, O_RDONLY | O_BINARY, 0);
+	  if (fd < 0)
 	    pfatal ("Can't reopen file %s", quotearg (from));
-	  while ((i = read (fd, buffer + size, PATH_MAX - size)) > 0)
+
+	  idx_t size = 0;
+	  for (idx_t i; 0 < (i = Read (fd, buffer + size, alloc - size)); )
 	    size += i;
-	  if (i != 0 || close (fd) != 0)
+	  if (close (fd) < 0)
 	    read_fatal ();
+	  if (size == alloc)
+	    fatal ("file %s grew", quotearg (from));
 	  buffer[size] = 0;
 
 	  if (! backup)
@@ -494,8 +566,10 @@ move_file (char const *from, bool *from_needs_removal,
 	    say ("Renaming file %s to %s\n",
 		 quotearg_n (0, from), quotearg_n (1, to));
 
+	  defer_signals ();
 	  if (safe_rename (from, to) != 0)
 	    {
+	      undefer_signals ();
 	      bool to_dir_known_to_exist = false;
 
 	      if (errno == ENOENT
@@ -503,8 +577,10 @@ move_file (char const *from, bool *from_needs_removal,
 		{
 		  makedirs (to);
 		  to_dir_known_to_exist = true;
+		  defer_signals ();
 		  if (safe_rename (from, to) == 0)
 		    goto rename_succeeded;
+		  undefer_signals ();
 		}
 
 	      if (errno == EXDEV)
@@ -517,7 +593,8 @@ move_file (char const *from, bool *from_needs_removal,
 		      else if (errno != ENOENT)
 			pfatal ("Can't remove file %s", quotearg (to));
 		    }
-		  copy_file (from, to, &tost, 0, mode, to_dir_known_to_exist);
+		  copy_file (from, fromst, &(struct outfile) { .name = to },
+			     &tost, 0, mode, 0, to_dir_known_to_exist);
 		  insert_file_id (&tost, CREATED);
 		  return;
 		}
@@ -527,14 +604,18 @@ move_file (char const *from, bool *from_needs_removal,
 	    }
 
 	rename_succeeded:
-	  insert_file_id (fromst, CREATED);
-	  /* Do not clear *FROM_NEEDS_REMOVAL if it's possible that the
+	  /* Do not clear outfrom->exists if it's possible that the
 	     rename returned zero because FROM and TO are hard links to
-	     the same file.  */
-	  if ((0 < to_errno
-	       || (to_errno == 0 && to_st.st_nlink <= 1))
-	      && from_needs_removal)
-	    *from_needs_removal = false;
+	     the same file.  This possibility can't occur if the
+	     source is a temporary file that we just created,
+	     or if the destination doesn't exist, or if the
+	     destination's link count is 1 (or zero!).  */
+	  if (outfrom->temporary || 0 < to_errno
+	      || (to_errno == 0 && to_st.st_nlink <= 1))
+	    outfrom->exists = nullptr;
+	  undefer_signals ();
+
+	  insert_file_id (fromst, CREATED);
 	}
     }
   else if (! backup)
@@ -546,62 +627,57 @@ move_file (char const *from, bool *from_needs_removal,
     }
 }
 
-/* Create FILE with OPEN_FLAGS, and with MODE adjusted so that
+/* Create OUT with OPEN_FLAGS, and with MODE adjusted so that
    we can read and write the file and that the file is not executable.
    Return the file descriptor.  */
 int
-create_file (char const *file, int open_flags, mode_t mode,
+create_file (struct outfile *out, int open_flags, mode_t mode,
 	     bool to_dir_known_to_exist)
 {
-  int try_makedirs_errno = to_dir_known_to_exist ? 0 : ENOENT;
-  int fd;
+  char *file = out->name;
   mode |= S_IRUSR | S_IWUSR;
   mode &= ~ (S_IXUSR | S_IXGRP | S_IXOTH);
-  do
+  defer_signals ();
+  int fd = safe_open (file, O_CREAT | O_TRUNC | open_flags, mode);
+  out->exists = fd < 0 ? nullptr : volatilize (file);
+  undefer_signals ();
+  if (fd < 0 && !to_dir_known_to_exist && errno == ENOENT)
     {
-      if (! (O_CREAT && O_TRUNC))
-	close (safe_open (file, O_CREAT | O_WRONLY | O_TRUNC, mode));
+      char *f = xstrdup (file);
+      makedirs (f);
+      free (f);
+      defer_signals ();
       fd = safe_open (file, O_CREAT | O_TRUNC | open_flags, mode);
-      if (fd < 0)
-	{
-	  char *f;
-	  if (errno != try_makedirs_errno)
-	    pfatal ("Can't create file %s", quotearg (file));
-	  f = xstrdup (file);
-	  makedirs (f);
-	  free (f);
-	  try_makedirs_errno = 0;
-	}
-    } while (fd < 0);
+      out->exists = fd < 0 ? nullptr : file;
+      undefer_signals ();
+    }
+  if (fd < 0)
+    pfatal ("Can't create file %s", quotearg (file));
   return fd;
 }
 
-static void
-copy_to_fd (const char *from, int tofd)
+static int
+copy_to_fd (char *from, int tofd)
 {
-  int fromfd;
-  ssize_t i;
-
-  if ((fromfd = safe_open (from, O_RDONLY | O_BINARY, 0)) < 0)
+  int from_flags = O_RDONLY | O_BINARY | (follow_symlinks ? 0 : O_NOFOLLOW);
+  int fromfd = safe_open (from, from_flags, 0);
+  if (fromfd < 0)
     pfatal ("Can't reopen file %s", quotearg (from));
-  while ((i = read (fromfd, buf, bufsize)) != 0)
-    {
-      if (i == (ssize_t) -1)
-	read_fatal ();
-      if (full_write (tofd, buf, i) != i)
-	write_fatal ();
-    }
-  if (close (fromfd) != 0)
-    read_fatal ();
+  for (idx_t i; 0 < (i = Read (fromfd, patchbuf, patchbufsize)); )
+    Write (tofd, patchbuf, i);
+  return fromfd;
 }
 
 /* Copy a file. */
 
 void
-copy_file (char const *from, char const *to, struct stat *tost,
-	   int to_flags, mode_t mode, bool to_dir_known_to_exist)
+copy_file (char *from, struct stat const *fromst,
+	   struct outfile *outto, struct stat *tost,
+	   int to_flags, mode_t mode, enum file_attributes attr,
+	   bool to_dir_known_to_exist)
 {
-  int tofd;
+  int fromfd, tofd;
+  char *to = outto->name;
 
   if (debug & 4)
     say ("Copying %s %s to %s\n",
@@ -610,42 +686,60 @@ copy_file (char const *from, char const *to, struct stat *tost,
 
   if (S_ISLNK (mode))
     {
-      char *buffer = xmalloc (PATH_MAX + 1);
-      ssize_t r;
+      idx_t alloc;
+      if (ckd_add (&alloc, fromst->st_size, 1))
+	xalloc_die ();
+      char *buffer = ximalloc (alloc);
+      ssize_t r = safe_readlink (from, buffer, alloc);
 
-      if ((r = safe_readlink (from, buffer, PATH_MAX)) < 0)
-	pfatal ("Can't read %s %s", "symbolic link", from);
+      if (r < 0)
+	pfatal ("Can't read symbolic link %s", from);
+      if (r == alloc)
+	fatal ("symbolic link %s grew", quotearg (from));
       buffer[r] = '\0';
-      if (safe_symlink (buffer, to) != 0)
+      defer_signals ();
+      outto->exists = safe_symlink (buffer, to) < 0 ? nullptr : volatilize (to);
+      undefer_signals ();
+      if (!outto->exists)
 	pfatal ("Can't create %s %s", "symbolic link", to);
       if (tost && safe_lstat (to, tost) != 0)
 	pfatal ("Can't get file attributes of %s %s", "symbolic link", to);
       free (buffer);
+      fromfd = tofd = -1;
     }
   else
     {
       assert (S_ISREG (mode));
-      tofd = create_file (to, O_WRONLY | O_BINARY | to_flags, mode,
+      if (! follow_symlinks)
+	to_flags |= O_NOFOLLOW;
+      tofd = create_file (outto, O_WRONLY | O_BINARY | to_flags, mode,
 			  to_dir_known_to_exist);
-      copy_to_fd (from, tofd);
+      fromfd = copy_to_fd (from, tofd);
       if (tost && fstat (tofd, tost) != 0)
 	pfatal ("Can't get file attributes of %s %s", "file", to);
-      if (close (tofd) != 0)
-	write_fatal ();
     }
+
+  set_file_attributes (to, tofd, attr, from, fromfd, fromst, mode, nullptr);
+  if (0 <= fromfd && close (fromfd) < 0)
+    read_fatal ();
+  if (0 <= tofd && close (tofd) < 0)
+    write_fatal ();
 }
 
 /* Append to file. */
 
 void
-append_to_file (char const *from, char const *to)
+append_to_file (char *from, char *to)
 {
-  int tofd;
-
-  if ((tofd = safe_open (to, O_WRONLY | O_BINARY | O_APPEND, 0)) < 0)
+  int to_flags = (O_WRONLY | O_APPEND | O_BINARY
+		  | (follow_symlinks ? 0 : O_NOFOLLOW));
+  int tofd = safe_open (to, to_flags, 0);
+  if (tofd < 0)
     pfatal ("Can't reopen file %s", quotearg (to));
-  copy_to_fd (from, tofd);
-  if (close (tofd) != 0)
+  int fromfd = copy_to_fd (from, tofd);
+  if (close (fromfd) < 0)
+    read_fatal ();
+  if (close (tofd) < 0)
     write_fatal ();
 }
 
@@ -656,7 +750,7 @@ static char const CHECKOUT[] = "co %s";
 static char const CHECKOUT_LOCKED[] = "co -l %s";
 static char const RCSDIFF1[] = "rcsdiff %s";
 
-static char const SCCSPREFIX[] = "s.";
+#define SCCSPREFIX "s."
 static char const GET[] = "get ";
 static char const GET_LOCKED[] = "get -e ";
 static char const SCCSDIFF1[] = "get -p ";
@@ -666,15 +760,31 @@ static char const CLEARTOOL_CO[] = "cleartool co -unr -nc ";
 
 static char const PERFORCE_CO[] = "p4 edit ";
 
-static size_t
+idx_t
 quote_system_arg (char *quoted, char const *arg)
 {
   char *q = quotearg_style (shell_quoting_style, arg);
-  size_t len = strlen (q);
+  idx_t len = strlen (q);
 
   if (quoted)
     memcpy (quoted, q, len + 1);
   return len;
+}
+
+/* Get the status of the file named by TRYBUF into ST.
+   Return true if successful, false (setting errno) otherwise.
+   Before getting the status, copy to DIREND the concatenation of A,
+   B, and (if nonnull) C; this can modify TRYBUF.  */
+static bool
+trystat (char *trybuf, struct stat *st, char *dirend,
+	 char const *a, char const *b, char const *c)
+{
+  char *p = stpcpy (dirend, a);
+  if (b)
+    p = stpcpy (p, b);
+  if (c)
+    strcpy (p, c);
+  return safe_stat (trybuf, st) == 0;
 }
 
 /* Return "RCS" if FILENAME is controlled by RCS,
@@ -686,38 +796,35 @@ quote_system_arg (char *quoted, char const *arg)
    FILESTAT describes FILENAME's status or is 0 if FILENAME does not exist.
    If successful and if GETBUF is nonzero, set *GETBUF to a command
    that gets the file; similarly for DIFFBUF and a command to diff the file
-   (but set *DIFFBUF to 0 if the diff operation is meaningless).
+   (but set *DIFFBUF to a null pointer if the diff operation is meaningless).
    *GETBUF and *DIFFBUF must be freed by the caller.  */
 char const *
 version_controller (char const *filename, bool readonly,
 		    struct stat const *filestat, char **getbuf, char **diffbuf)
 {
   struct stat cstat;
-  char *dir = dir_name (filename);
-  char *filebase = base_name (filename);
+  char const *filebase = last_component (filename);
   char const *dotslash = *filename == '-' ? "./" : "";
-  size_t dirlen = strlen (dir) + 1;
-  size_t maxfixlen = sizeof "SCCS/" - 1 + sizeof SCCSPREFIX - 1;
-  size_t maxtrysize = dirlen + strlen (filebase) + maxfixlen + 1;
-  size_t quotelen = quote_system_arg (0, dir) + quote_system_arg (0, filebase);
-  size_t maxgetsize = sizeof CLEARTOOL_CO + quotelen + maxfixlen;
-  size_t maxdiffsize =
+  idx_t dirlen = filebase - filename;
+  idx_t filebaselen = strlen (filebase);
+  idx_t maxfixlen = sizeof "SCCS/" - 1 + sizeof SCCSPREFIX - 1;
+  idx_t maxtrysize = dirlen + filebaselen + maxfixlen + 1;
+  idx_t quotelen = quote_system_arg (0, filename);
+  idx_t maxgetsize = sizeof CLEARTOOL_CO + quotelen + maxfixlen;
+  idx_t maxdiffsize =
     (sizeof SCCSDIFF1 + sizeof SCCSDIFF2 + sizeof DEV_NULL - 1
      + 2 * quotelen + maxfixlen);
-  char *trybuf = xmalloc (maxtrysize);
+  char *trybuf = ximalloc (maxtrysize);
   char const *r = 0;
 
-  sprintf (trybuf, "%s/", dir);
-
-#define try1(f,a1)    (sprintf (trybuf + dirlen, f, a1),    safe_stat (trybuf, &cstat) == 0)
-#define try2(f,a1,a2) (sprintf (trybuf + dirlen, f, a1,a2), safe_stat (trybuf, &cstat) == 0)
+  char *dirend = mempcpy (trybuf, filename, dirlen);
 
   /* Check that RCS file is not working file.
      Some hosts don't report file name length errors.  */
 
-  if ((try2 ("RCS/%s%s", filebase, RCSSUFFIX)
-       || try1 ("RCS/%s", filebase)
-       || try2 ("%s%s", filebase, RCSSUFFIX))
+  if ((trystat (trybuf, &cstat, dirend, "RCS/", filebase, RCSSUFFIX)
+       || trystat (trybuf, &cstat, dirend, "RCS/", filebase, 0)
+       || trystat (trybuf, &cstat, dirend, filebase, RCSSUFFIX, nullptr))
       && ! (filestat
 	    && filestat->st_dev == cstat.st_dev
 	    && filestat->st_ino == cstat.st_ino))
@@ -725,8 +832,7 @@ version_controller (char const *filename, bool readonly,
       if (getbuf)
 	{
 	  char *p = *getbuf = xmalloc (maxgetsize);
-	  sprintf (p, readonly ? CHECKOUT : CHECKOUT_LOCKED, dotslash);
-	  p += strlen (p);
+	  p += sprintf (p, readonly ? CHECKOUT : CHECKOUT_LOCKED, dotslash);
 	  p += quote_system_arg (p, filename);
 	  *p = '\0';
 	}
@@ -734,8 +840,7 @@ version_controller (char const *filename, bool readonly,
       if (diffbuf)
 	{
 	  char *p = *diffbuf = xmalloc (maxdiffsize);
-	  sprintf (p, RCSDIFF1, dotslash);
-	  p += strlen (p);
+	  p += sprintf (p, RCSDIFF1, dotslash);
 	  p += quote_system_arg (p, filename);
 	  *p++ = '>';
 	  strcpy (p, DEV_NULL);
@@ -743,14 +848,14 @@ version_controller (char const *filename, bool readonly,
 
       r = "RCS";
     }
-  else if (try2 ("SCCS/%s%s", SCCSPREFIX, filebase)
-	   || try2 ("%s%s", SCCSPREFIX, filebase))
+  else if (trystat (trybuf, &cstat, dirend, "SCCS/" SCCSPREFIX, filebase,
+		    nullptr)
+	   || trystat (trybuf, &cstat, dirend, SCCSPREFIX, filebase, nullptr))
     {
       if (getbuf)
 	{
 	  char *p = *getbuf = xmalloc (maxgetsize);
-	  sprintf (p, readonly ? GET : GET_LOCKED);
-	  p += strlen (p);
+	  p += sprintf (p, readonly ? GET : GET_LOCKED);
 	  p += quote_system_arg (p, trybuf);
 	  *p = '\0';
 	}
@@ -761,8 +866,7 @@ version_controller (char const *filename, bool readonly,
 	  strcpy (p, SCCSDIFF1);
 	  p += sizeof SCCSDIFF1 - 1;
 	  p += quote_system_arg (p, trybuf);
-	  sprintf (p, SCCSDIFF2, dotslash);
-	  p += strlen (p);
+	  p += sprintf (p, SCCSDIFF2, dotslash);
 	  p += quote_system_arg (p, filename);
 	  *p++ = '>';
 	  strcpy (p, DEV_NULL);
@@ -771,7 +875,8 @@ version_controller (char const *filename, bool readonly,
       r = "SCCS";
     }
   else if (!readonly && filestat
-	   && try1 ("%s@@", filebase) && S_ISDIR (cstat.st_mode))
+	   && trystat (trybuf, &cstat, dirend, filebase, "@@", nullptr)
+	   && S_ISDIR (cstat.st_mode))
     {
       if (getbuf)
 	{
@@ -806,8 +911,6 @@ version_controller (char const *filename, bool readonly,
     }
 
   free (trybuf);
-  free (filebase);
-  free (dir);
   return r;
 }
 
@@ -817,14 +920,14 @@ version_controller (char const *filename, bool readonly,
    Store the resulting file status into *FILESTAT.
    Return true if successful.  */
 bool
-version_get (char const *filename, char const *cs, bool exists, bool readonly,
+version_get (char *filename, char const *cs, bool exists, bool readonly,
 	     char const *getbuf, struct stat *filestat)
 {
   if (patch_get < 0)
     {
-      ask ("Get file %s from %s%s? [y] ",
-	   quotearg (filename), cs, readonly ? "" : " with lock");
-      if (*buf == 'n')
+      if (*ask ("Get file %s from %s%s? [y] ",
+		quotearg (filename), cs, readonly ? "" : " with lock")
+	  == 'n')
 	return 0;
     }
 
@@ -851,62 +954,9 @@ version_get (char const *filename, char const *cs, bool exists, bool readonly,
 /* Allocate a unique area for a string. */
 
 char *
-savebuf (char const *s, size_t size)
+savebuf (char const *s, idx_t size)
 {
-  char *rv;
-
-  if (! size)
-    return NULL;
-
-  rv = malloc (size);
-
-  if (! rv)
-    {
-      if (! using_plan_a)
-	xalloc_die ();
-    }
-  else
-    memcpy (rv, s, size);
-
-  return rv;
-}
-
-char *
-savestr (char const *s)
-{
-  return savebuf (s, strlen (s) + 1);
-}
-
-void
-remove_prefix (char *p, size_t prefixlen)
-{
-  char const *s = p + prefixlen;
-  while ((*p++ = *s++))
-    /* do nothing */ ;
-}
-
-char *
-format_linenum (char numbuf[LINENUM_LENGTH_BOUND + 1], lin n)
-{
-  char *p = numbuf + LINENUM_LENGTH_BOUND;
-  *p = '\0';
-
-  if (n < 0)
-    {
-      do
-	*--p = '0' - (int) (n % 10);
-      while ((n /= 10) != 0);
-
-      *--p = '-';
-    }
-  else
-    {
-      do
-	*--p = '0' + (int) (n % 10);
-      while ((n /= 10) != 0);
-    }
-
-  return p;
+  return size ? xmemdup (s, size) : nullptr;
 }
 
 /* Terminal output, pun intended. */
@@ -914,14 +964,15 @@ format_linenum (char numbuf[LINENUM_LENGTH_BOUND + 1], lin n)
 void
 fatal (char const *format, ...)
 {
+  fputs (program_name, stderr);
+  fputs (": **** ", stderr);
   va_list args;
-  fprintf (stderr, "%s: **** ", program_name);
   va_start (args, format);
   vfprintf (stderr, format, args);
   va_end (args);
-  putc ('\n', stderr);
+  fputc ('\n', stderr);
   fflush (stderr);
-  fatal_exit (0);
+  fatal_exit ();
 }
 
 void
@@ -942,31 +993,46 @@ write_fatal (void)
   pfatal ("write error");
 }
 
+/* Output to FP a line containing the concatenation of the remaining
+   string arguments.  A null pointer terminates the string args.  */
+void
+putline (FILE *fp, ...)
+{
+  va_list ap;
+  va_start (ap, fp);
+  for (char *arg; (arg = va_arg (ap, char *)); )
+    Fputs (arg, fp);
+  va_end (ap);
+  Fputc ('\n', fp);
+}
+
 /* Say something from patch, something from the system, then silence . . . */
 
 void
 pfatal (char const *format, ...)
 {
   int errnum = errno;
+  fputs (program_name, stderr);
+  fputs (": **** ", stderr);
   va_list args;
-  fprintf (stderr, "%s: **** ", program_name);
   va_start (args, format);
   vfprintf (stderr, format, args);
   va_end (args);
-  fflush (stderr); /* perror bypasses stdio on some hosts.  */
-  errno = errnum;
-  perror (" ");
+  fprintf (stderr, " : %s\n",
+	   errnum == EILSEQ ? "Invalid byte sequence" : strerror (errnum));
   fflush (stderr);
-  fatal_exit (0);
+  fatal_exit ();
 }
 
 /* Tell the user something.  */
 
 static void
+ATTRIBUTE_FORMAT ((_GL_ATTRIBUTE_SPEC_PRINTF_STANDARD, 1, 0))
 vsay (char const *format, va_list args)
 {
-  vfprintf (stdout, format, args);
-  fflush (stdout);
+  if (vfprintf (stdout, format, args) < 0)
+    write_fatal ();
+  Fflush (stdout);
 }
 
 void
@@ -980,17 +1046,18 @@ say (char const *format, ...)
 
 /* Get a response from the user, somehow or other. */
 
-void
+char *
 ask (char const *format, ...)
 {
   static int ttyfd = -2;
-  ssize_t r;
   va_list args;
 
   va_start (args, format);
-  vfprintf (stdout, format, args);
+  int nout = vfprintf (stdout, format, args);
   va_end (args);
-  fflush (stdout);
+  if (nout < 0)
+    write_fatal ();
+  Fflush (stdout);
 
   if (ttyfd == -2)
     {
@@ -998,7 +1065,7 @@ ask (char const *format, ...)
 	 since it's unlikely that stdout will be seen by the tty user.
 	 The isatty test also works around a bug in GNU Emacs 19.34 under Linux
 	 which makes a call-process 'patch' hang when it reads from /dev/tty.
-	 POSIX.1-2001 XCU line 26599 requires that we read /dev/tty,
+	 POSIX.1-2024 line 109671 requires that we read /dev/tty,
 	 though.  */
       ttyfd = (posixly_correct || isatty (STDOUT_FILENO)
 	       ? open (TTY_DEVICE, O_RDONLY)
@@ -1008,33 +1075,39 @@ ask (char const *format, ...)
   if (ttyfd < 0)
     {
       /* No terminal at all -- default it.  */
-      printf ("\n");
-      buf[0] = '\n';
-      buf[1] = '\0';
+      Fputc ('\n', stdout);
+      patchbuf[0] = '\n';
+      patchbuf[1] = '\0';
     }
   else
     {
-      size_t s = 0;
-      while ((r = read (ttyfd, buf + s, bufsize - 1 - s)) == bufsize - 1 - s
-	     && buf[bufsize - 2] != '\n')
+      idx_t s = 0;
+      while (true)
 	{
-	  s = bufsize - 1;
-	  bufsize *= 2;
-	  buf = realloc (buf, bufsize);
-	  if (!buf)
-	    xalloc_die ();
+	  idx_t readsize = MIN (patchbufsize - 1 - s, IO_BUFSIZE);
+	  ssize_t r = read (ttyfd, patchbuf + s, readsize);
+	  if (r <= 0)
+	    {
+	      if (r == 0)
+		Fputs ("EOF\n", stdout);
+	      else
+		{
+		  error (0, errno, "tty read failed");
+		  ignore_value (close (ttyfd));
+		  ttyfd = -1;
+		}
+	      break;
+	    }
+	  s += r;
+	  if (r < readsize || patchbuf[s - 1] == '\n')
+	    break;
+	  if (s == patchbufsize - 1)
+	    grow_patchbuf ();
 	}
-      if (r == 0)
-	printf ("EOF\n");
-      else if (r < 0)
-	{
-	  error (0, errno, "tty read failed");
-	  ignore_value (close (ttyfd));
-	  ttyfd = -1;
-	  r = 0;
-	}
-      buf[s + r] = '\0';
+      patchbuf[s] = '\0';
     }
+
+  return patchbuf;
 }
 
 /* Return nonzero if it OK to reverse a patch.  */
@@ -1044,7 +1117,7 @@ ok_to_reverse (char const *format, ...)
 {
   bool r = false;
 
-  if (noreverse || ! (force && verbosity == SILENT))
+  if (noreverse_flag || ! (force && verbosity == SILENT))
     {
       va_list args;
       va_start (args, format);
@@ -1052,7 +1125,7 @@ ok_to_reverse (char const *format, ...)
       va_end (args);
     }
 
-  if (noreverse)
+  if (noreverse_flag)
     {
       say ("  Skipping patch.\n");
       skip_rest_of_patch = true;
@@ -1064,17 +1137,16 @@ ok_to_reverse (char const *format, ...)
     }
   else if (batch)
     {
-      say (reverse ? "  Ignoring -R.\n" : "  Assuming -R.\n");
+      say (reverse_flag ? "  Ignoring -R.\n" : "  Assuming -R.\n");
       r = true;
     }
   else
     {
-      ask (reverse ? "  Ignore -R? [n] " : "  Assume -R? [n] ");
-      r = *buf == 'y';
+      r = (*ask (reverse_flag ? "  Ignore -R? [n] " : "  Assume -R? [n] ")
+	   == 'y');
       if (! r)
 	{
-	  ask ("Apply anyway? [n] ");
-	  if (*buf != 'y')
+	  if (*ask ("Apply anyway? [n] ") != 'y')
 	    {
 	      if (verbosity != SILENT)
 		say ("Skipping patch.\n");
@@ -1086,137 +1158,111 @@ ok_to_reverse (char const *format, ...)
   return r;
 }
 
-/* How to handle certain events when not in a critical region. */
+/* Critical sections and signals.  */
 
-#define NUM_SIGS ((int) (sizeof (sigs) / sizeof (*sigs)))
-static int const sigs[] = {
-#ifdef SIGHUP
-       SIGHUP,
+/* If nonzero, the corresponding signal was the first one received.
+   Otherwise, no signal has been received.  */
+static sig_atomic_t volatile signal_received;
+
+/* Whether we are in a critical section, so that signals are deferred
+   until the next call to undefer_signal.  */
+static sig_atomic_t signals_are_deferred;
+
+/* Signal SIG has arrived and can be acted on now.
+   Clean up and arrange to terminate.
+   This function is async-signal-safe.  */
+static void
+fatal_cleanup_and_terminate (int sig)
+{
+  fatal_cleanup ();
+
+  /* Cause the program to terminate with signal SIG.  Termination occurs now
+     if not in a signal handler, otherwise when the signal handler returns.  */
+  signal (sig, SIG_DFL);
+  raise (sig);
+}
+
+/* Handle a delivered signal.  While this function is running,
+   all signals that 'patch' cares about are blocked.
+   This function is async-signal-safe.  */
+static void
+handle_signal (int sig)
+{
+#if ! (HAVE_SIGACTION && HAVE_SIGFILLSET)
+  /* Cater to non-POSIX systems that lack sigaction and reset to SIG_DFL.  */
+  signal (sig, SIG_IGN);
 #endif
+
+  /* If multiple signals arrive, handle just the first one.
+     That's good enough, as 'patch' is about to exit.  */
+  if (signal_received)
+    return;
+  signal_received = sig;
+
+  if (!signals_are_deferred)
+    {
+      signals_are_deferred = 1;	/* Avoid infinite recursion.  */
+      fatal_cleanup_and_terminate (sig);
+    }
+}
+
+/* Defer incoming signals until later.  */
+void
+defer_signals (void)
+{
+  signals_are_deferred = 1;
+}
+
+/* Handle any signals that have arrived, and stop deferring them.  */
+void
+undefer_signals (void)
+{
+  signals_are_deferred = 0;
+  int sig = signal_received;
+  if (sig)
+    fatal_cleanup_and_terminate (sig);
+}
+
+void
+init_signals (void)
+{
+  static int const sigs[] =
+    {
+      SIGHUP,
+      SIGINT,
 #ifdef SIGPIPE
-       SIGPIPE,
+      SIGPIPE,
 #endif
 #ifdef SIGTERM
-       SIGTERM,
+      SIGTERM,
 #endif
 #ifdef SIGXCPU
-       SIGXCPU,
+      SIGXCPU,
 #endif
 #ifdef SIGXFSZ
-       SIGXFSZ,
+      SIGXFSZ,
 #endif
-       SIGINT
-};
+    };
+  enum { NUM_SIGS = sizeof sigs / sizeof *sigs };
 
-#if !HAVE_SIGPROCMASK
-#define sigset_t int
-#define sigemptyset(s) (*(s) = 0)
-#ifndef sigmask
-#define sigmask(sig) (1 << ((sig) - 1))
-#endif
-#define sigaddset(s, sig) (*(s) |= sigmask (sig))
-#define sigismember(s, sig) ((*(s) & sigmask (sig)) != 0)
-#define sigprocmask(how, n, o) \
-  ((how) == SIG_BLOCK \
-   ? ((o) ? *(o) = sigblock (*(n)) : sigblock (*(n))) \
-   : (how) == SIG_UNBLOCK \
-   ? sigsetmask (((o) ? *(o) = sigblock (0) : sigblock (0)) & ~*(n)) \
-   : (o ? *(o) = sigsetmask (*(n)) : sigsetmask (*(n))))
-#if !HAVE_SIGSETMASK
-#define sigblock(mask) 0
-#define sigsetmask(mask) 0
-#endif
-#endif
+  /* System V fork+wait does not work if SIGCHLD is ignored.  */
+  signal (SIGCHLD, SIG_DFL);
 
-static sigset_t initial_signal_mask;
-static sigset_t signals_to_block;
-
-#if ! HAVE_SIGACTION
-static void fatal_exit_handler (int) __attribute__ ((noreturn));
-static void
-fatal_exit_handler (int sig)
-{
-  signal (sig, SIG_IGN);
-  fatal_exit (sig);
-}
-#endif
-
-void
-set_signals (bool reset)
-{
-  int i;
-#if HAVE_SIGACTION
-  struct sigaction initial_act, fatal_act;
-  fatal_act.sa_handler = fatal_exit;
-  sigemptyset (&fatal_act.sa_mask);
-  fatal_act.sa_flags = 0;
-#define setup_handler(sig) sigaction (sig, &fatal_act, (struct sigaction *) 0)
-#else
-#define setup_handler(sig) signal (sig, fatal_exit_handler)
-#endif
-
-  if (!reset)
+#if HAVE_SIGACTION && HAVE_SIGFILLSET
+  struct sigaction fatal_act = { .sa_handler = handle_signal };
+  sigfillset (&fatal_act.sa_mask);
+  for (int i = 0; i < NUM_SIGS; i++)
     {
-#ifdef SIGCHLD
-      /* System V fork+wait does not work if SIGCHLD is ignored.  */
-      signal (SIGCHLD, SIG_DFL);
-#endif
-      sigemptyset (&signals_to_block);
-      for (i = 0;  i < NUM_SIGS;  i++)
-	{
-	  bool ignoring_signal;
-#if HAVE_SIGACTION
-	  if (sigaction (sigs[i], (struct sigaction *) 0, &initial_act) != 0)
-	    continue;
-	  ignoring_signal = initial_act.sa_handler == SIG_IGN;
-#else
-	  ignoring_signal = signal (sigs[i], SIG_IGN) == SIG_IGN;
-#endif
-	  if (! ignoring_signal)
-	    {
-	      sigaddset (&signals_to_block, sigs[i]);
-	      setup_handler (sigs[i]);
-	    }
-	}
+      struct sigaction initial_act;
+      if (sigaction (sigs[i], nullptr, &initial_act) == 0
+	  && initial_act.sa_handler != SIG_IGN)
+	sigaction (sigs[i], &fatal_act, nullptr);
     }
-  else
-    {
-      /* Undo the effect of ignore_signals.  */
-#if HAVE_SIGPROCMASK || HAVE_SIGSETMASK
-      sigprocmask (SIG_SETMASK, &initial_signal_mask, (sigset_t *) 0);
 #else
-      for (i = 0;  i < NUM_SIGS;  i++)
-	if (sigismember (&signals_to_block, sigs[i]))
-	  setup_handler (sigs[i]);
+  for (int i = 0; i < NUM_SIGS; i++)
+    if (signal (sigs[i], SIG_IGN) != SIG_IGN)
+      signal (sigs[i], handle_signal);
 #endif
-    }
-}
-
-/* How to handle certain events when in a critical region. */
-
-void
-ignore_signals (void)
-{
-#if HAVE_SIGPROCMASK || HAVE_SIGSETMASK
-  sigprocmask (SIG_BLOCK, &signals_to_block, &initial_signal_mask);
-#else
-  int i;
-  for (i = 0;  i < NUM_SIGS;  i++)
-    if (sigismember (&signals_to_block, sigs[i]))
-      signal (sigs[i], SIG_IGN);
-#endif
-}
-
-void
-exit_with_signal (int sig)
-{
-  sigset_t s;
-  signal (sig, SIG_DFL);
-  sigemptyset (&s);
-  sigaddset (&s, sig);
-  sigprocmask (SIG_UNBLOCK, &s, (sigset_t *) 0);
-  raise (sig);
-  exit (2);
 }
 
 int
@@ -1224,7 +1270,7 @@ systemic (char const *command)
 {
   if (debug & 8)
     say ("+ %s\n", command);
-  fflush (stdout);
+  Fflush (stdout);
   return system (command);
 }
 
@@ -1310,9 +1356,8 @@ void
 removedirs (char const *name)
 {
   char *filename = xstrdup (name);
-  size_t i;
 
-  for (i = strlen (filename);  i != 0;  i--)
+  for (idx_t i = strlen (filename);  i != 0;  i--)
     if (ISSLASH (filename[i])
 	&& ! (ISSLASH (filename[i - 1])
 	      || (filename[i - 1] == '.'
@@ -1356,10 +1401,9 @@ parse_c_string (char const *s, char const **endp)
 	    goto fail;
 
 	  case '"':
-	    *v++ = 0;
-	    v = realloc (u, v - u);
-	    if (v)
-	      u = v;
+	    *v = '\0';
+	    /* 'u = xrealloc (u, v + 1 - u);' would save a bit of space here,
+	       but would likely be more trouble than it's worth.  */
 	    if (endp)
 	      *endp = s;
 	    return u;
@@ -1396,6 +1440,8 @@ parse_c_string (char const *s, char const **endp)
 	      if (c < '0' || c > '7')
 	        goto fail;
 	      acc |= (c - '0');
+	      if (!acc)
+		goto fail;
 	      c = acc;
 	      break;
 	    }
@@ -1409,17 +1455,17 @@ fail:
   free (u);
   if (endp)
     *endp = s;
-  return NULL;
+  return nullptr;
 }
 
 /* Strip up to STRIP_LEADING leading slashes.
    If STRIP_LEADING is negative, strip all leading slashes.
-   Returns a pointer into NAME on success, and NULL otherwise.
+   Returns a pointer into NAME on success, and a null pointer otherwise.
   */
 static bool
-strip_leading_slashes (char *name, int strip_leading)
+strip_leading_slashes (char *name, intmax_t strip_leading)
 {
-  int s = strip_leading;
+  intmax_t s = strip_leading;
   char *p, *n;
 
   for (p = n = name;  *p;  p++)
@@ -1445,21 +1491,18 @@ strip_leading_slashes (char *name, int strip_leading)
 /* Make filenames more reasonable. */
 
 void
-fetchname (char const *at, int strip_leading, char **pname,
+fetchname (char const *at, intmax_t strip_leading, char **pname,
 	   char **ptimestr, struct timespec *pstamp)
 {
     char *name;
     const char *t;
-    char *timestr = NULL;
-    struct timespec stamp;
+    char *timestr = nullptr;
+    struct timespec stamp = { .tv_sec = -1, .tv_nsec = -1 };
 
-    stamp.tv_sec = -1;
-    stamp.tv_nsec = 0;
-
-    while (ISSPACE ((unsigned char) *at))
+    while (c_isspace (*at))
 	at++;
     if (debug & 128)
-	say ("fetchname %s %d\n", at, strip_leading);
+	say ("fetchname %s %jd\n", at, strip_leading);
 
     if (*at == '"')
       {
@@ -1475,19 +1518,19 @@ fetchname (char const *at, int strip_leading, char **pname,
       {
 	for (t = at;  *t;  t++)
 	  {
-	    if (ISSPACE ((unsigned char) *t))
+	    if (c_isspace (*t))
 	      {
 		/* Allow file names with internal spaces,
 		   but only if a tab separates the file name from the date.  */
 		char const *u = t;
-		while (*u != '\t' && ISSPACE ((unsigned char) u[1]))
+		while (*u != '\t' && c_isspace (u[1]))
 		  u++;
 		if (*u != '\t' && (strchr (u + 1, pstamp ? '\t' : '\n')))
 		  continue;
 		break;
 	      }
 	  }
-	name = xmemdup0 (at, t - at);
+	name = ximemdup0 (at, t - at);
       }
 
     /* If the name is "/dev/null", ignore the name and mark the file
@@ -1519,7 +1562,7 @@ fetchname (char const *at, int strip_leading, char **pname,
 	  u--;
 	if (u != t && *(u-1) == '\r')
 	  u--;
-	timestr = xmemdup0 (t, u - t);
+	timestr = ximemdup0 (t, u - t);
       }
 
       if (*t != '\n')
@@ -1531,24 +1574,27 @@ fetchname (char const *at, int strip_leading, char **pname,
 	      return;
 	    }
 
-	  if (set_time | set_utc)
-	    get_date (&stamp, t, &initial_time);
-	  else
-	    {
-	      /* The head says the file is nonexistent if the
-		 timestamp is the epoch; but the listed time is
-		 local time, not UTC, and POSIX.1 allows local
-		 time offset anywhere in the range -25:00 <
-		 offset < +26:00.  Match any time in that range.  */
-	      const struct timespec lower = { -25L * 60 * 60 },
-				    upper = {  26L * 60 * 60 };
-	      if (get_date (&stamp, t, &initial_time)
-		  && timespec_cmp (stamp, lower) > 0
-		  && timespec_cmp (stamp, upper) < 0) {
-		      stamp.tv_sec = 0;
-		      stamp.tv_nsec = 0;
-	      }
-	    }
+	  /* The head says a file is nonexistent if its timestamp is the epoch;
+	     but when the listed time is local time not UTC, POSIX.1
+	     allows local time offset anywhere in the range
+	     -25:00 < offset < +26:00, so match any time in that range.
+	     The algorithm below can match a time when it is close to
+	     but not at the epoch if the time string has a timezone
+	     indication, but this bug would be a pain to fix and the
+	     situation is so rare that it is perhaps not worth fixing.  */
+
+	  if ((parse_datetime (&stamp, t, &initial_time)
+	       & ! (set_time | set_utc))
+	      && (!TYPE_SIGNED (time_t)
+		  || (timespec_cmp (((struct timespec)
+				     { .tv_sec = -25 * 60 * 60 }),
+				    stamp)
+		      < 0))
+	      && (timespec_cmp (stamp,
+				((struct timespec)
+				 { .tv_sec = 26 * 60 * 60 }))
+		  < 0))
+	    stamp = (struct timespec) {0};
 	}
 
     free (*pname);
@@ -1563,76 +1609,163 @@ fetchname (char const *at, int strip_leading, char **pname,
 }
 
 char *
-parse_name (char const *s, int strip_leading, char const **endp)
+parse_name (char const *s, intmax_t strip_leading, char const **endp)
 {
   char *ret;
 
-  while (ISSPACE ((unsigned char) *s))
+  while (c_isspace (*s))
     s++;
   if (*s == '"')
     {
       ret = parse_c_string (s, endp);
       if (!ret)
-        return NULL;
+        return nullptr;
     }
   else
     {
       char const *t;
 
-      for (t = s; *t && ! ISSPACE ((unsigned char) *t); t++)
+      for (t = s; *t && !c_isspace (*t); t++)
 	/* do nothing*/ ;
-      ret = xmemdup0 (s, t - s);
+      ret = ximemdup0 (s, t - s);
       if (endp)
 	*endp = t;
     }
   if (! strip_leading_slashes (ret, strip_leading))
     {
       free (ret);
-      ret = NULL;
+      ret = nullptr;
     }
   return ret;
 }
 
 void
-Fseek (FILE *stream, file_offset offset, int ptrname)
+Fclose (FILE *stream)
 {
-  if (file_seek (stream, offset, ptrname) != 0)
-    pfatal ("fseek");
+  Fflush (stream);
+  if (fclose (stream) < 0)
+    write_fatal ();
 }
 
+void
+Fflush (FILE *stream)
+{
+  if (fflush (stream) < 0)
+    write_fatal ();
+}
+
+void
+Fprintf (FILE *stream, char const *format, ...)
+{
+  va_list args;
+  va_start (args, format);
+  int nout = vfprintf (stream, format, args);
+  va_end (args);
+  if (nout < 0)
+    write_fatal ();
+}
+
+void
+Fputc (int c, FILE *stream)
+{
+  if (fputc (c, stream) < 0)
+    write_fatal ();
+}
+
+void
+Fputs (char const *s, FILE *stream)
+{
+  if (fputs (s, stream) < 0)
+    write_fatal ();
+}
+
+void
+Fseeko (FILE *stream, off_t offset, int ptrname)
+{
+  if (fseeko (stream, offset, ptrname) < 0)
+    pfatal ("fseeko");
+}
+
+off_t
+Ftello (FILE *stream)
+{
+  off_t off = ftello (stream);
+  if (off < 0)
+    pfatal ("ftello");
+  return off;
+}
+
+void
+Fwrite (void const *ptr, size_t size, size_t nitems, FILE *stream)
+{
+  if (fwrite (ptr, size, nitems, stream) < nitems)
+    write_fatal ();
+}
+
+idx_t
+Read (int filedes, void *buf, idx_t nbyte)
+{
+  ssize_t r = read (filedes, buf, MIN (nbyte, IO_BUFSIZE));
+  if (r < 0)
+    read_fatal ();
+  return r;
+}
+
+static void
+Write (int filedes, void const *buf, idx_t nbyte)
+{
+  char const *b = buf, *blim = b + nbyte;
+  while (b < blim)
+    {
+      ssize_t w = write (filedes, b, MIN (blim - b, IO_BUFSIZE));
+      if (w < 0)
+	write_fatal ();
+      b += w;
+    }
+}
+
+/* Name of default temporary directory; must not contain \n.  */
 #ifndef TMPDIR
 #define TMPDIR "/tmp"
 #endif
 
 struct try_safe_open_args
   {
+    struct outfile *out;
     int flags;
     mode_t mode;
   };
 
-static int try_safe_open (char *template, void *__args)
+static int
+try_safe_open (char *template, void *vargs)
 {
-  struct try_safe_open_args *args = __args;
-  int try_makedirs_errno = ENOENT;
-  int fd;
-
-repeat:
-  fd = safe_open (template, O_CREAT | O_EXCL | args->flags, args->mode);
-  if (fd < 0 && errno == try_makedirs_errno)
-    {
-      makedirs (template);
-      try_makedirs_errno = 0;
-      goto repeat;
-    }
+  struct try_safe_open_args *args = vargs;
+  struct outfile *out = args->out;
+  int flags = O_CREAT | O_EXCL | args->flags;
+  mode_t mode = args->mode;
+  defer_signals ();
+  int fd = safe_open (template, flags, mode);
+  out->exists = fd < 0 ? nullptr : volatilize (template);
+  undefer_signals ();
+  if (0 <= fd || errno != ENOENT)
+    return fd;
+  makedirs (template);
+  defer_signals ();
+  fd = safe_open (template, flags, mode);
+  out->exists = fd < 0 ? nullptr : volatilize (template);
+  int err = errno;
+  undefer_signals ();
+  errno = err;
   return fd;
 }
 
 int
-make_tempfile (char const **name, char letter, char const *real_name,
+make_tempfile (struct outfile *out, char letter, char const *real_name,
 	       int flags, mode_t mode)
 {
   char *template;
   struct try_safe_open_args args = {
+    .out = out,
     .flags = flags,
     .mode = mode,
   };
@@ -1640,39 +1773,54 @@ make_tempfile (char const **name, char letter, char const *real_name,
 
   if (real_name && ! dry_run)
     {
-      char *dirname, *basename;
-
-      dirname = dir_name (real_name);
-      basename = base_name (real_name);
-
-      template = xmalloc (strlen (dirname) + 1 + strlen (basename) + 9);
-      sprintf (template, "%s/%s.%cXXXXXX", dirname, basename, letter);
-      free (dirname);
-      free (basename);
+      /* Use the real name sans any newlines in the last component,
+	 followed by ".", LETTER, and 6 random chars.  */
+      char const *last = last_component (real_name);
+      idx_t realdirlen = last - real_name;
+      template = ximalloc (realdirlen + strlen (last) + sizeof ".cXXXXXX");
+      char *t = mempcpy (template, real_name, realdirlen);
+      for (char const *p = last; *p; p++)
+	t += (*t = *p) != '\n';
+      sprintf (t, ".%cXXXXXX", letter);
     }
   else
     {
-      char const *tmpdir;
+      /* In the temp dir, use the name "p", LETTER, and 6 random chars.  */
 
-      tmpdir = getenv ("TMPDIR");  /* Unix tradition */
-      if (! tmpdir)
-	tmpdir = getenv ("TMP");  /* DOS tradition */
-      if (! tmpdir)
-	tmpdir = getenv ("TEMP");  /* another DOS tradition */
-      if (! tmpdir)
-	tmpdir = TMPDIR;
+      static char const *tmpdir;
+      static idx_t tmpdirlen;
 
-      template = xmalloc (strlen (tmpdir) + 10);
-      sprintf (template, "%s/p%cXXXXXX", tmpdir, letter);
+      if (!tmpdir)
+	{
+	  tmpdir = TMPDIR;
+
+	  /* TMPDIR is the Unix tradition; TMP and TEMP are DOS traditions.  */
+	  static char const envnames[][sizeof "TMPDIR"]
+	    = { "TMPDIR", "TMP", "TEMP" };
+	  for (int i = 0; i < ARRAY_SIZE (envnames); i++)
+	    {
+	      char const *val = getenv (envnames[i]);
+	      if (val)
+		{
+		  tmpdir = val;
+		  break;
+		}
+	    }
+	  tmpdirlen = strlen (tmpdir);
+	}
+
+      template = ximalloc (tmpdirlen + 10);
+      sprintf (mempcpy (template, tmpdir, tmpdirlen), "/p%cXXXXXX", letter);
     }
-  fd = try_tempname(template, 0, &args, try_safe_open);
-  *name = template;
+  fd = try_tempname (template, 0, &args, try_safe_open);
+  out->name = out->alloc = template;
   return fd;
 }
 
-int stat_file (char const *filename, struct stat *st)
+int
+stat_file (char *filename, struct stat *st)
 {
-  int (*xstat)(char const *, struct stat *) =
+  int (*xstat) (char *, struct stat *) =
     follow_symlinks ? safe_stat : safe_lstat;
 
   return xstat (filename, st) == 0 ? 0 : errno;
@@ -1705,20 +1853,44 @@ filename_is_safe (char const *name)
 bool
 cwd_is_root (char const *name)
 {
-  unsigned int prefix_len = FILE_SYSTEM_PREFIX_LEN (name);
-  char root[prefix_len + 2];
+  int prefix_len = FILE_SYSTEM_PREFIX_LEN (name);
   struct stat st;
   dev_t root_dev;
   ino_t root_ino;
 
-  memcpy (root, name, prefix_len);
-  root[prefix_len] = '/';
-  root[prefix_len + 1] = 0;
-  if (stat (root, &st))
-    return false;
-  root_dev = st.st_dev;
-  root_ino = st.st_ino;
-  if (stat (".", &st))
-    return false;
-  return root_dev == st.st_dev && root_ino == st.st_ino;
+  if (prefix_len == 0)
+    {
+      static dev_t main_root_dev;
+      static ino_t main_root_ino;
+      if (!main_root_ino)
+	{
+	  if (stat ("/", &st) < 0)
+	    return false;
+	  main_root_dev = st.st_dev;
+	  main_root_ino = st.st_ino;
+	}
+      root_dev = main_root_dev;
+      root_ino = main_root_ino;
+    }
+  else
+    {
+      char root[4];
+      memcpy (root, name, prefix_len);
+      root[prefix_len] = '/';
+      root[prefix_len + 1] = 0;
+      if (stat (root, &st) < 0)
+	return false;
+      root_dev = st.st_dev;
+      root_ino = st.st_ino;
+    }
+  static dev_t cwd_dev;
+  static ino_t cwd_ino;
+  if (!cwd_ino)
+    {
+      if (stat (".", &st) < 0)
+	return false;
+      cwd_dev = st.st_dev;
+      cwd_ino = st.st_ino;
+    }
+  return (root_dev == cwd_dev) & (root_ino == cwd_ino);
 }

@@ -1,4 +1,4 @@
-# Copyright (C) 2009, 2011-2012 Free Software Foundation, Inc.
+# Copyright 2009-2025 Free Software Foundation, Inc.
 #
 # Copying and distribution of this file, with or without modification,
 # in any medium, are permitted without royalty provided the copyright
@@ -6,8 +6,12 @@
 
 . $srcdir/test-lib.sh
 
+# Note: This test fails on Haiku. This is normal; it is caused by
+# Haiku bug <https://dev.haiku-os.org/ticket/19213>.
+
 require cat
 require sed
+require chmod
 use_local_patch
 use_tmpdir
 
@@ -52,7 +56,7 @@ EOF
 # Some non-GNU versions of date can't show a file's timestamp
 timestamp2_touch=`echo "$timestamp2" | sed -e "$sed_expr"`
 TZ=UTC touch -t $timestamp2_touch f.compare
-ncheck 'test ! \( f -ot f.compare -o f -nt f.compare \) || echo "timstamp differs"'
+ncheck 'test ! \( f -ot f.compare -o f -nt f.compare \) || echo "timestamp differs"'
 
 # POSIX allows a byte like '+' or '.' in position 11 to indicate the
 # presence of extended permissions like ACLs.
@@ -118,4 +122,4 @@ check 'patch -p1 --backup --set-utc < f.diff' <<EOF
 patching file f
 EOF
 
-ncheck 'test ! \( f -ot f.compare -o f -nt f.compare \) || echo "timstamp differs"'
+ncheck 'test ! \( f -ot f.compare -o f -nt f.compare \) || echo "timestamp differs"'

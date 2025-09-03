@@ -1,9 +1,7 @@
 /* utility functions for 'patch' */
 
-/* Copyright (C) 1986 Larry Wall
-
-   Copyright (C) 1992-1993, 1997-1999, 2001-2003, 2009-2012 Free Software
-   Foundation, Inc.
+/* Copyright 1992-2025 Free Software Foundation, Inc.
+   Copyright 1986 Larry Wall
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -22,54 +20,7 @@
 #include <stat-time.h>
 #include <backupfile.h>
 
-/* An upper bound on the print length of a signed decimal line number.
-   Add one for the sign.  */
-#define LINENUM_LENGTH_BOUND (sizeof (lin) * CHAR_BIT / 3 + 1)
-
 enum file_id_type { UNKNOWN, CREATED, DELETE_LATER, OVERWRITTEN };
-
-XTERN enum backup_type backup_type;
-
-bool ok_to_reverse (char const *, ...) __attribute__ ((format (printf, 1, 2)));
-void ask (char const *, ...) __attribute__ ((format (printf, 1, 2)));
-void say (char const *, ...) __attribute__ ((format (printf, 1, 2)));
-
-void fatal (char const *, ...)
-	__attribute__ ((noreturn, format (printf, 1, 2)));
-void pfatal (char const *, ...)
-	__attribute__ ((noreturn, format (printf, 1, 2)));
-
-void fetchname (char const *, int, char **, char **, struct timespec *);
-char *parse_name (char const *, int, char const **);
-char *savebuf (char const *, size_t);
-char *savestr (char const *);
-char const *version_controller (char const *, bool, struct stat const *, char **, char **);
-bool version_get (char const *, char const *, bool, bool, char const *, struct stat *);
-int create_file (char const *, int, mode_t, bool);
-int systemic (char const *);
-char *format_linenum (char[LINENUM_LENGTH_BOUND + 1], lin);
-void Fseek (FILE *, file_offset, int);
-void copy_file (char const *, char const *, struct stat *, int, mode_t, bool);
-void append_to_file (char const *, char const *);
-void exit_with_signal (int) __attribute__ ((noreturn));
-void ignore_signals (void);
-void init_backup_hash_table (void);
-void init_time (void);
-void xalloc_die (void) __attribute__ ((noreturn));
-void create_backup (char const *, const struct stat *, bool);
-void move_file (char const *, bool *, struct stat const *, char const *, mode_t, bool);
-void read_fatal (void) __attribute__ ((noreturn));
-void remove_prefix (char *, size_t);
-void removedirs (char const *);
-void set_signals (bool);
-void write_fatal (void) __attribute__ ((noreturn));
-void insert_file_id (struct stat const *, enum file_id_type);
-enum file_id_type lookup_file_id (struct stat const *);
-void set_queued_output (struct stat const *, bool);
-bool has_queued_output (struct stat const *);
-int stat_file (char const *, struct stat *);
-bool filename_is_safe (char const *) _GL_ATTRIBUTE_PURE;
-bool cwd_is_root (char const *);
 
 enum file_attributes {
   FA_TIMES = 1,
@@ -78,15 +29,89 @@ enum file_attributes {
   FA_XATTRS = 8
 };
 
-void set_file_attributes (char const *, enum file_attributes, char const *,
-			  const struct stat *, mode_t, struct timespec *);
+/* Exit status for trouble, such as write failure.  */
+enum { EXIT_TROUBLE = 2 };
 
-static inline char const * _GL_ATTRIBUTE_PURE
-skip_spaces (char const *str)
+/* Read or write at most IO_BUFSIZE bytes at a time.
+   In 2024 256 KiB was determined to be the best blocksize
+   to minimize system call overhead across most systems
+   when copying files.  See coreutils/src/ioblksize.h.  */
+enum { IO_BUFSIZE = 256 * 1024 };
+
+/* POSIX says behavior is implementation-defined for I/O requests
+   larger than SSIZE_MAX.  IO_BUFSIZE is OK on all known platforms.
+   Check it to be sure.  */
+static_assert (IO_BUFSIZE <= SSIZE_MAX);
+
+extern enum backup_type backup_type;
+
+_GL_INLINE_HEADER_BEGIN
+#ifndef UTIL_INLINE
+# define UTIL_INLINE _GL_INLINE
+#endif
+
+char volatile *volatilize (char *);
+
+/* Convert S to a pointer to non-volatile.  This is the inverse of volatilize.
+   S’s contents must not be updated by a signal handler.  */
+UTIL_INLINE char *
+devolatilize (char volatile *s)
 {
-  while (ISSPACE ((unsigned char) *str))
-    str++;
-  return str;
+  return (char *) s;
 }
 
-int make_tempfile(char const **, char, char const *, int, mode_t);
+bool ok_to_reverse (char const *, ...) ATTRIBUTE_FORMAT ((printf, 1, 2));
+char *ask (char const *, ...) ATTRIBUTE_FORMAT ((printf, 1, 2));
+void say (char const *, ...) ATTRIBUTE_FORMAT ((printf, 1, 2));
+
+_Noreturn void fatal (char const *, ...) ATTRIBUTE_FORMAT ((printf, 1, 2));
+_Noreturn void pfatal (char const *, ...) ATTRIBUTE_FORMAT ((printf, 1, 2));
+
+void fetchname (char const *, intmax_t, char **, char **, struct timespec *);
+char *parse_name (char const *, intmax_t, char const **);
+char *savebuf (char const *, idx_t)
+  ATTRIBUTE_MALLOC ATTRIBUTE_DEALLOC_FREE ATTRIBUTE_ALLOC_SIZE ((2));
+char const *version_controller (char const *, bool, struct stat const *, char **, char **);
+bool version_get (char *, char const *, bool, bool, char const *, struct stat *);
+int create_file (struct outfile *, int, mode_t, bool);
+int systemic (char const *);
+void Fclose (FILE *);
+void Fflush (FILE *);
+void Fprintf (FILE *, char const *, ...) ATTRIBUTE_FORMAT ((printf, 2, 3));
+void Fputc (int, FILE *);
+void Fputs (char const *restrict, FILE *restrict);
+void Fseeko (FILE *, off_t, int);
+off_t Ftello (FILE *);
+void Fwrite (void const *restrict, size_t, size_t, FILE *restrict);
+idx_t Read (int, void *, idx_t);
+void copy_file (char *, struct stat const *, struct outfile *, struct stat *,
+		int, mode_t, enum file_attributes, bool);
+void append_to_file (char *, char *);
+idx_t quote_system_arg (char *, char const *);
+void init_signals (void);
+void defer_signals (void);
+void undefer_signals (void);
+void init_backup_hash_table (void);
+void init_time (void);
+_Noreturn void xalloc_die (void);
+void create_backup (char *, const struct stat *, bool);
+void move_file (struct outfile *, struct stat const *,
+		char *, mode_t, bool);
+_Noreturn void read_fatal (void);
+void removedirs (char const *);
+_Noreturn void write_fatal (void);
+void putline (FILE *, ...);
+void insert_file_id (struct stat const *, enum file_id_type);
+enum file_id_type lookup_file_id (struct stat const *);
+void set_queued_output (struct stat const *, bool);
+bool has_queued_output (struct stat const *);
+int stat_file (char *, struct stat *);
+bool filename_is_safe (char const *) ATTRIBUTE_PURE;
+bool cwd_is_root (char const *);
+
+void set_file_attributes (char *, int, enum file_attributes, char const *, int,
+			  const struct stat *, mode_t, struct timespec *);
+
+int make_tempfile (struct outfile *, char, char const *, int, mode_t);
+
+_GL_INLINE_HEADER_END

@@ -1,8 +1,7 @@
 /* inputting files to be patched */
 
-/* Copyright (C) 1986, 1988 Larry Wall
-   Copyright (C) 1991-1993, 1997-1999, 2002-2003, 2009-2012 Free Software
-   Foundation, Inc.
+/* Copyright 1991-2025 Free Software Foundation, Inc.
+   Copyright 1986, 1988 Larry Wall
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -17,9 +16,14 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
 
-XTERN lin input_lines;		/* how long is input file in lines */
+/* Number of lines in input file.  */
+extern idx_t input_lines;
 
-char const *ifetch (lin, bool, size_t *);
-bool get_input_file (char const *, char const *, mode_t);
+/* Description of an input line: a pointer to its start, and the
+   number of bytes in it (including any trailing newline).  */
+struct iline { char const *ptr; idx_t size; };
+
+struct iline ifetch (idx_t) ATTRIBUTE_PURE;
+bool get_input_file (char *, char const *, mode_t);
 void re_input (void);
-void scan_input (char *, mode_t);
+void scan_input (char *, mode_t, int);

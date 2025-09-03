@@ -12,6 +12,10 @@ else
 CONFFLAGS = --build $(DEB_BUILD_GNU_TYPE) --host $(DEB_HOST_GNU_TYPE)
 endif
 
+ifeq ($(DEB_HOST_ARCH),hurd-i386)
+  CONFFLAGS += --disable-year2038
+endif
+
 export DEB_CFLAGS_MAINT_APPEND = -Wall -g
 
 override_dh_auto_clean:

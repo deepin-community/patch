@@ -2,8 +2,8 @@ Source: patch
 Section: vcs
 Priority: optional
 Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
-Build-Depends: debhelper-compat (= 11), ed
-Standards-Version: 4.5.1
+Build-Depends: debhelper-compat (= 13), ed
+Standards-Version: 4.7.2
 Homepage: https://savannah.gnu.org/projects/patch/
 Rules-Requires-Root: no
 

@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2012 Free Software Foundation, Inc.
+# Copyright 2011-2025 Free Software Foundation, Inc.
 #
 # Copying and distribution of this file, with or without modification,
 # in any medium, are permitted without royalty provided the copyright
@@ -124,6 +124,57 @@ EOF
 echo 1 > g
 check 'patch -f -p1 --dry-run < d.diff || echo status: $?' <<EOF
 checking file g
+EOF
+
+fixup='s/ file ab\.[^ ]*/ file ab.*/'
+check_ignoring_temp_file_name() {
+  pat=\'$1\'
+  unset arg1; eval ${2+"arg1=\\''$2'\\'"}
+  unset arg2; eval ${3+"arg2=\\''$3'\\'"}
+  check '
+    emit_patch '"$pat"' | patch '"$arg1"' '"$arg2"' >patch.out 2>&1
+    status=$?
+    sed "$fixup" patch.out
+    echo status: $status
+  '
+}
+
+nl='
+'
+nlname="a${nl}b"
+quoted_nlname='"a\nb"'
+
+check_ignoring_temp_file_name "$quoted_nlname" <<EOF
+patching file 'a
+b'
+$PATCH: **** Can't rename file ab.* to 'a
+b' : Invalid byte sequence
+status: 2
+EOF
+
+check_ignoring_temp_file_name foo "$nlname" <<EOF
+patching file 'a
+b'
+$PATCH: **** Can't rename file ab.* to 'a
+b' : Invalid byte sequence
+status: 2
+EOF
+
+check_ignoring_temp_file_name foo -o "$nlname" <<EOF
+$PATCH: **** Can't create file 'a
+b' : Invalid byte sequence
+status: 2
+EOF
+
+emit_patch_with_NUL()
+{
+  printf '%s\n' '--- /dev/null'
+  printf '+++ a\0b\n'
+  printf '%s\n' '@@ -0,0 +1 @@' '+x'
+}
+check 'emit_patch_with_NUL | patch; echo status: $?' <<EOF
+$PATCH: **** patch line 2 contains NUL byte
+status: 2
 EOF
 
 mkdir d

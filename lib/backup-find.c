@@ -1,10 +1,10 @@
 /* backupfile.c -- make Emacs style backup file names
 
-   Copyright 2017-2018 Free Software Foundation, Inc.
+   Copyright 2017-2025 Free Software Foundation, Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -24,14 +24,16 @@
 
 #include <stdlib.h>
 
-/* Return the name of a backup file for the existing file FILE,
-   allocated with malloc.  Report an error and exit if out of memory.
-   Do not call this function if backup_type == no_backups.  */
+/* Relative to DIR_FD, return the name of a backup file for the
+   existing file FILE, allocated with malloc.  Report an error and
+   exit if out of memory.  Do not call this function if
+   backup_type == no_backups.  */
 
 char *
-find_backup_file_name (char const *file, enum backup_type backup_type)
+find_backup_file_name (int dir_fd, char const *file,
+                       enum backup_type backup_type)
 {
-  char *result = backupfile_internal (file, backup_type, false);
+  char *result = backupfile_internal (dir_fd, file, backup_type, false);
   if (!result)
     xalloc_die ();
   return result;
@@ -68,7 +70,7 @@ ARGMATCH_VERIFY (backup_args, backup_types);
 enum backup_type
 get_version (char const *context, char const *version)
 {
-  if (version == 0 || *version == 0)
+  if (version == NULL || *version == 0)
     return numbered_existing_backups;
   else
     return XARGMATCH (context, version, backup_args, backup_types);

@@ -1,12 +1,21 @@
-# errno_h.m4 serial 12
-dnl Copyright (C) 2004, 2006, 2008-2018 Free Software Foundation, Inc.
+# errno_h.m4
+# serial 18
+dnl Copyright (C) 2004, 2006, 2008-2025 Free Software Foundation, Inc.
 dnl This file is free software; the Free Software Foundation
 dnl gives unlimited permission to copy and/or distribute it,
 dnl with or without modifications, as long as this notice is preserved.
+dnl This file is offered as-is, without any warranty.
+
+AC_PREREQ([2.61])
 
 AC_DEFUN_ONCE([gl_HEADER_ERRNO_H],
 [
   AC_REQUIRE([AC_PROG_CC])
+
+  dnl Through the dependency on module extensions-aix, _LINUX_SOURCE_COMPAT
+  dnl gets defined already before this macro gets invoked.  This persuades
+  dnl AIX 7.3 errno.h to assign ENOTEMPTY a value different than EEXIST.
+
   AC_CACHE_CHECK([for complete errno.h], [gl_cv_header_errno_h_complete], [
     AC_EGREP_CPP([booboo],[
 #include <errno.h>
@@ -61,18 +70,19 @@ booboo
 #if !defined EILSEQ
 booboo
 #endif
+#if !defined ESOCKTNOSUPPORT
+booboo
+#endif
       ],
       [gl_cv_header_errno_h_complete=no],
       [gl_cv_header_errno_h_complete=yes])
   ])
   if test $gl_cv_header_errno_h_complete = yes; then
-    ERRNO_H=''
+    GL_GENERATE_ERRNO_H=false
   else
     gl_NEXT_HEADERS([errno.h])
-    ERRNO_H='errno.h'
+    GL_GENERATE_ERRNO_H=true
   fi
-  AC_SUBST([ERRNO_H])
-  AM_CONDITIONAL([GL_GENERATE_ERRNO_H], [test -n "$ERRNO_H"])
   gl_REPLACE_ERRNO_VALUE([EMULTIHOP])
   gl_REPLACE_ERRNO_VALUE([ENOLINK])
   gl_REPLACE_ERRNO_VALUE([EOVERFLOW])
@@ -86,7 +96,7 @@ booboo
 # Set the variables EOVERFLOW_HIDDEN and EOVERFLOW_VALUE.
 AC_DEFUN([gl_REPLACE_ERRNO_VALUE],
 [
-  if test -n "$ERRNO_H"; then
+  if $GL_GENERATE_ERRNO_H; then
     AC_CACHE_CHECK([for ]$1[ value], [gl_cv_header_errno_h_]$1, [
       AC_EGREP_CPP([yes],[
 #include <errno.h>
@@ -128,10 +138,4 @@ yes
     AC_SUBST($1[_HIDDEN])
     AC_SUBST($1[_VALUE])
   fi
-])
-
-dnl Autoconf >= 2.61 has AC_COMPUTE_INT built-in.
-dnl Remove this when we can assume autoconf >= 2.61.
-m4_ifdef([AC_COMPUTE_INT], [], [
-  AC_DEFUN([AC_COMPUTE_INT], [_AC_COMPUTE_INT([$2],[$1],[$3],[$4])])
 ])

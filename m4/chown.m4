@@ -1,12 +1,13 @@
-# serial 29
-# Determine whether we need the chown wrapper.
-
-dnl Copyright (C) 1997-2001, 2003-2005, 2007, 2009-2018 Free Software
+# chown.m4
+# serial 36
+dnl Copyright (C) 1997-2001, 2003-2005, 2007, 2009-2025 Free Software
 dnl Foundation, Inc.
-
 dnl This file is free software; the Free Software Foundation
 dnl gives unlimited permission to copy and/or distribute it,
 dnl with or without modifications, as long as this notice is preserved.
+dnl This file is offered as-is, without any warranty.
+
+# Determine whether we need the chown wrapper.
 
 # chown should accept arguments of -1 for uid and gid, and it should
 # dereference symlinks.  If it doesn't, arrange to use the replacement
@@ -27,7 +28,7 @@ AC_DEFUN([AC_FUNC_CHOWN],
        [AC_LANG_PROGRAM(
           [AC_INCLUDES_DEFAULT
            [#include <fcntl.h>
-          ]],
+          ]GL_MDA_DEFINES],
           [[
             char *f = "conftest.chown";
             struct stat before, after;
@@ -46,12 +47,14 @@ AC_DEFUN([AC_FUNC_CHOWN],
        [ac_cv_func_chown_works=yes],
        [ac_cv_func_chown_works=no],
        [case "$host_os" in # ((
-                         # Guess yes on glibc systems.
-          *-gnu* | gnu*) ac_cv_func_chown_works="guessing yes" ;;
-                         # Guess no on native Windows.
-          mingw*)        ac_cv_func_chown_works="guessing no" ;;
-                         # If we don't know, assume the worst.
-          *)             ac_cv_func_chown_works="guessing no" ;;
+                             # Guess yes on Linux systems.
+          linux-* | linux)   ac_cv_func_chown_works="guessing yes" ;;
+                             # Guess yes on glibc systems.
+          *-gnu* | gnu*)     ac_cv_func_chown_works="guessing yes" ;;
+                             # Guess no on native Windows.
+          mingw* | windows*) ac_cv_func_chown_works="guessing no" ;;
+                             # If we don't know, obey --enable-cross-guesses.
+          *)                 ac_cv_func_chown_works="$gl_cross_guess_normal" ;;
         esac
        ])
      rm -f conftest.chown
@@ -78,9 +81,10 @@ AC_DEFUN_ONCE([gl_FUNC_CHOWN],
     HAVE_CHOWN=0
   else
     dnl Some old systems treated chown like lchown.
-    if test $gl_cv_func_chown_follows_symlink = no; then
-      REPLACE_CHOWN=1
-    fi
+    case "$gl_cv_func_chown_follows_symlink" in
+      *yes) ;;
+      *) REPLACE_CHOWN=1 ;;
+    esac
 
     dnl Some old systems tried to use uid/gid -1 literally.
     case "$ac_cv_func_chown_works" in
@@ -101,16 +105,19 @@ AC_DEFUN_ONCE([gl_FUNC_CHOWN],
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
-]], [[    if (symlink ("conftest.file", "conftest.link")) return 1;
+]GL_MDA_DEFINES],
+        [[if (symlink ("conftest.file", "conftest.link")) return 1;
           if (chown ("conftest.link/", getuid (), getgid ()) == 0) return 2;
         ]])],
         [gl_cv_func_chown_slash_works=yes],
         [gl_cv_func_chown_slash_works=no],
         [case "$host_os" in
-                   # Guess yes on glibc systems.
-           *-gnu*) gl_cv_func_chown_slash_works="guessing yes" ;;
-                   # If we don't know, assume the worst.
-           *)      gl_cv_func_chown_slash_works="guessing no" ;;
+                    # Guess yes on glibc systems.
+           *-gnu*)  gl_cv_func_chown_slash_works="guessing yes" ;;
+                    # Guess yes on musl systems.
+           *-musl*) gl_cv_func_chown_slash_works="guessing yes" ;;
+                    # If we don't know, obey --enable-cross-guesses.
+           *)       gl_cv_func_chown_slash_works="$gl_cross_guess_normal" ;;
          esac
         ])
       rm -f conftest.link conftest.file])
@@ -132,7 +139,8 @@ AC_DEFUN_ONCE([gl_FUNC_CHOWN],
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-]], [[    struct stat st1, st2;
+]GL_MDA_DEFINES],
+        [[struct stat st1, st2;
           if (close (creat ("conftest.file", 0600))) return 1;
           if (stat ("conftest.file", &st1)) return 2;
           sleep (1);
@@ -143,10 +151,12 @@ AC_DEFUN_ONCE([gl_FUNC_CHOWN],
         [gl_cv_func_chown_ctime_works=yes],
         [gl_cv_func_chown_ctime_works=no],
         [case "$host_os" in
-                   # Guess yes on glibc systems.
-           *-gnu*) gl_cv_func_chown_ctime_works="guessing yes" ;;
-                   # If we don't know, assume the worst.
-           *)      gl_cv_func_chown_ctime_works="guessing no" ;;
+                    # Guess yes on glibc systems.
+           *-gnu*)  gl_cv_func_chown_ctime_works="guessing yes" ;;
+                    # Guess yes on musl systems.
+           *-musl*) gl_cv_func_chown_ctime_works="guessing yes" ;;
+                    # If we don't know, obey --enable-cross-guesses.
+           *)       gl_cv_func_chown_ctime_works="$gl_cross_guess_normal" ;;
          esac
         ])
       rm -f conftest.file])
@@ -172,7 +182,7 @@ AC_DEFUN_ONCE([gl_FUNC_CHOWN_FOLLOWS_SYMLINK],
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
-
+]GL_MDA_DEFINES[
         int
         main ()
         {
@@ -194,13 +204,16 @@ AC_DEFUN_ONCE([gl_FUNC_CHOWN_FOLLOWS_SYMLINK],
         ]])],
         [gl_cv_func_chown_follows_symlink=yes],
         [gl_cv_func_chown_follows_symlink=no],
-        [gl_cv_func_chown_follows_symlink=yes]
+        [gl_cv_func_chown_follows_symlink="guessing yes"]
       )
     ]
   )
 
-  if test $gl_cv_func_chown_follows_symlink = no; then
-    AC_DEFINE([CHOWN_MODIFIES_SYMLINK], [1],
-      [Define if chown modifies symlinks.])
-  fi
+  case "$gl_cv_func_chown_follows_symlink" in
+    *yes) ;;
+    *)
+      AC_DEFINE([CHOWN_MODIFIES_SYMLINK], [1],
+        [Define if chown modifies symlinks.])
+      ;;
+  esac
 ])
