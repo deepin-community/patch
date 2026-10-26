@@ -2,3 +2,4 @@ m-merge
 add_some_missing_filename_quoting.patch
 reject_empty_filenames.patch
 skip_read-only_check_when_output_file_specified.patch
+CVE-2026-115207.patch

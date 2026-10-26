@@ -1,3 +1,12 @@
+patch (2.8-2deepin1) unstable; urgency=medium
+
+  * fix(cve): CVE-2026-115207 (medium) - Prevent creation of out-of-tree
+    files (CVE-2026-115207)   Upstream:
+    https://git.savannah.gnu.org/cgit/patch.git/patch/?id=0cd45bb2132a42
+    cd38d84b20661f3eae9b4da7ce
+
+ -- deepin-ci-robot <packages@deepin.org>  Mon, 26 Oct 2026 10:30:55 +0800
+
 patch (2.8-2) unstable; urgency=medium
 
   [ Samuel Thibault <sthibault@debian.org> ]
